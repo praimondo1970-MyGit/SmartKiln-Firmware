@@ -1,0 +1,4 @@
+# Aumentar pila de la tarea host NimBLE para evitar stack overflow
+# al conectar por BLE (callbacks con JSON/NVS/WiFi usan mucha pila).
+# Por defecto suele ser 4096; 8192 suele ser suficiente.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
