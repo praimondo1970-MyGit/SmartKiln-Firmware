@@ -1,0 +1,102 @@
+#include <Arduino.h>
+#include <Preferences.h>
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000); // Esperar a que se inicialice el Serial
+    
+    Serial.println("=================================");
+    Serial.println("🧹 LIMPIADOR DE CACHE DE HORNOS");
+    Serial.println("=================================");
+    Serial.println("Iniciando limpieza automática...");
+    
+    // Crear objeto Preferences
+    Preferences preferences;
+    
+    // Limpiar namespace "kiln_config"
+    Serial.println("\n📁 Limpiando namespace 'kiln_config'...");
+    if (preferences.begin("kiln_config", false)) {
+        Serial.println("✅ Namespace 'kiln_config' abierto correctamente");
+        
+        // Eliminar todas las claves relacionadas con hornos
+        bool nameCleared = preferences.remove("name");
+        bool modelCleared = preferences.remove("model");
+        bool volumeCleared = preferences.remove("volume");
+        bool userIdCleared = preferences.remove("userId");
+        
+        Serial.println("📊 Resultado de la limpieza:");
+        Serial.printf("  - name: %s\n", nameCleared ? "✅ ELIMINADO" : "❌ NO ENCONTRADO");
+        Serial.printf("  - model: %s\n", modelCleared ? "✅ ELIMINADO" : "❌ NO ENCONTRADO");
+        Serial.printf("  - volume: %s\n", volumeCleared ? "✅ ELIMINADO" : "❌ NO ENCONTRADO");
+        Serial.printf("  - userId: %s\n", userIdCleared ? "✅ ELIMINADO" : "❌ NO ENCONTRADO");
+        
+        // Cerrar el namespace
+        preferences.end();
+        Serial.println("🔒 Namespace 'kiln_config' cerrado");
+        
+    } else {
+        Serial.println("❌ Error: No se pudo abrir el namespace 'kiln_config'");
+    }
+    
+    // Limpiar otros namespaces comunes
+    const char* namespaces[] = {
+        "kiln_data", 
+        "device_config",
+        "user_data",
+        "firebase_config"
+    };
+    
+    int namespaceCount = sizeof(namespaces) / sizeof(namespaces[0]);
+    
+    Serial.println("\n📁 Limpiando otros namespaces...");
+    for (int i = 0; i < namespaceCount; i++) {
+        Serial.printf("🔍 Verificando namespace: '%s'\n", namespaces[i]);
+        
+        if (preferences.begin(namespaces[i], false)) {
+            // Eliminar todas las claves del namespace
+            preferences.clear();
+            preferences.end();
+            Serial.printf("✅ Namespace '%s' eliminado\n", namespaces[i]);
+        } else {
+            Serial.printf("⚠️  Namespace '%s' no existe\n", namespaces[i]);
+        }
+    }
+    
+    // Verificación final
+    Serial.println("\n🔍 Verificación final...");
+    if (preferences.begin("kiln_config", true)) { // Solo lectura
+        String testName = preferences.getString("name", "NO_ENCONTRADO");
+        String testModel = preferences.getString("model", "NO_ENCONTRADO");
+        float testVolume = preferences.getFloat("volume", -1.0);
+        String testUserId = preferences.getString("userId", "NO_ENCONTRADO");
+        
+        Serial.println("📊 Estado final del cache:");
+        Serial.printf("  - name: '%s'\n", testName.c_str());
+        Serial.printf("  - model: '%s'\n", testModel.c_str());
+        Serial.printf("  - volume: %.1f\n", testVolume);
+        Serial.printf("  - userId: '%s'\n", testUserId.c_str());
+        
+        preferences.end();
+        
+        if (testName == "NO_ENCONTRADO" && testModel == "NO_ENCONTRADO" && 
+            testVolume == -1.0 && testUserId == "NO_ENCONTRADO") {
+            Serial.println("\n🎉 ✅ CACHE ELIMINADO COMPLETAMENTE");
+        } else {
+            Serial.println("\n⚠️  ❌ Algunos datos no se eliminaron correctamente");
+        }
+    } else {
+        Serial.println("✅ Namespace 'kiln_config' no existe (ya estaba limpio)");
+    }
+    
+    Serial.println("\n=================================");
+    Serial.println("🏁 LIMPIEZA COMPLETADA");
+    Serial.println("=================================");
+    Serial.println("El ESP32 está listo para recibir nuevos datos de hornos.");
+    Serial.println("Puedes desconectar y volver a cargar el firmware principal.");
+    Serial.println("=================================");
+}
+
+void loop() {
+    // No hacer nada en el loop - solo ejecutar una vez
+    delay(1000);
+}
