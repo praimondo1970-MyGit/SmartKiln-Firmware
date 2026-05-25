@@ -3,6 +3,8 @@
 #include "wifi_manager.h"
 #include <ArduinoJson.h>
 
+extern void kiln_notifyLocalSessionComplete();
+
 String kiln_buildStatusJson() {
     StaticJsonDocument<512> doc;
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -12,6 +14,22 @@ String kiln_buildStatusJson() {
         doc["numStages"] = curvaActual.recibida ? curvaActual.numSegmentos : 0;
         doc["profileLoaded"] = curvaActual.recibida;
         doc["programDurationMin"] = programTotalDurationMinutes;
+        int elapsedMin = 0;
+        int remainingMin = 0;
+        if (programStartTime > 0) {
+            unsigned long elapsedMs = millis() - programStartTime;
+            if (programPauseTime > 0 && estadoHorno == "PAUSADO") {
+                elapsedMs = programPauseTime - programStartTime;
+            }
+            elapsedMin = (int)(elapsedMs / 60000UL);
+            remainingMin = programTotalDurationMinutes - elapsedMin;
+            if (remainingMin < 0) {
+                remainingMin = 0;
+            }
+        }
+        doc["elapsedMinutes"] = elapsedMin;
+        doc["remainingMinutes"] = remainingMin;
+        doc["currentStage"] = curvaActual.recibida && curvaActual.numSegmentos > 0 ? 1 : 0;
         xSemaphoreGive(xMutex);
     } else {
         doc["error"] = "mutex_timeout";
@@ -114,6 +132,9 @@ String kiln_processCommand(const String& cmdRaw) {
     resp["ok"] = true;
     resp["cmd"] = cmd;
     resp["status"] = estadoHorno;
+    if (cmd == "START" || cmd == "PAUSE" || cmd == "STOP") {
+        kiln_onLocalSessionEnd(cmd.c_str());
+    }
     String out;
     serializeJson(resp, out);
     return out;
@@ -154,6 +175,7 @@ bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
 
     saveProfile();
     Serial.printf("[API] Perfil cargado: %s (%d seg)\n", curvaActual.nombre, curvaActual.numSegmentos);
+    kiln_onLocalSessionEnd("profile");
     return true;
 }
 
@@ -191,5 +213,12 @@ bool kiln_applyKilnInfoJson(const String& jsonStr, String& errorOut) {
     }
     xSemaphoreGive(xMutex);
     Serial.println("[API] kiln-info aplicado");
+    kiln_onLocalSessionEnd("kiln-info");
     return true;
+}
+
+void kiln_onLocalSessionEnd(const char* reason) {
+    Serial.printf("[API] Fin sesion local (%s)\n", reason ? reason : "?");
+    wifi_manager_requestApRelease();
+    kiln_notifyLocalSessionComplete();
 }

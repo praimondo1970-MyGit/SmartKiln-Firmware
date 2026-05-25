@@ -1,14 +1,17 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 #include "Wire.h"
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include <Adafruit_MAX31855.h>
-// Deshabilitar logs de debug de NimBLE antes de incluir
-#define NIMBLE_CPP_LOG_LEVEL 0  // 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG
 #include <esp_log.h>
+#include "smartkiln_config.h"
+#if SMARTKILN_ENABLE_BLE
+#define NIMBLE_CPP_LOG_LEVEL 0
 #include <NimBLEDevice.h>
 #include "NimBLE2904.h"
+#endif
 #include <Preferences.h>
 #include "esp_wifi.h"
 #include "silent_serial.h"
@@ -59,7 +62,8 @@ void printCrashInfo() {
 
 // -------------------- DECLARACIONES DE FUNCIONES --------------------
 void reportToFirebase(float temp, const String& estado);
-void updateDeviceInfoFirebase();
+bool updateDeviceInfoFirebase();
+void onStaGainedConnection();
 void saveKilnInfo();
 void loadKilnInfo();
 void saveWifiConfig();
@@ -70,6 +74,10 @@ void logStoredData();
 void reconnectToWifi();
 String getMacAddress();
 bool initFirebase();
+void scheduleFirebaseInit(const char* reason);
+void kiln_notifyLocalSessionComplete();
+void kiln_onApRadioTransitionBegin();
+void processImmediateFirebaseSync();
 int calculateProgramTotalDuration(float initialTemp);
 float leerTermocupla();
 #if defined(ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -103,11 +111,13 @@ FirebaseConfig* config = nullptr;
 
 SemaphoreHandle_t xMutex = NULL;
 
+#if SMARTKILN_ENABLE_BLE
 NimBLEServer* pServer = nullptr;
 NimBLECharacteristic* gTempChar;
 NimBLECharacteristic* gStatusChar;
 NimBLECharacteristic* gUserIdChar;
 NimBLECharacteristic* gProgramNameChar;
+#endif
 
 float temperaturaActual = 0.0;
 String estadoHorno = "IDLE";
@@ -132,6 +142,7 @@ bool needsWifiReconnect = false;
 volatile bool pendingWifiConfigSave = false;  // BLE: diferir save/load WiFi a TaskComunicaciones (evitar stack overflow en callback NimBLE)
 volatile bool pendingKilnInfoSave = false;   // BLE: diferir saveKilnInfo() a TaskComunicaciones
 bool statusLogsEnabled = false;
+volatile bool needsImmediateFirebaseSync = false;
 
 // NUEVO: Variables para control de suspensión WiFi/BLE
 bool bleClientConnected = false;  // Indica si hay un cliente BLE conectado
@@ -156,8 +167,11 @@ CurvaActiva curvaActual = {"", {}, 0, false};
 
 String getMacAddress() {
     uint8_t baseMac[6];
-    // Usar MAC del Bluetooth para coincidir con el MAC que ve la app al escanear BLE
+#if SMARTKILN_ENABLE_BLE
     esp_read_mac(baseMac, ESP_MAC_BT);
+#else
+    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+#endif
     
     char macStr[18] = {0};
     sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
@@ -226,7 +240,7 @@ void debugPrintWifiCredentials(const char* context, const String& ssid, const St
     Serial.println("=================================");
     Serial.printf("[WiFi][DEBUG] %s\n", context);
     Serial.printf("[WiFi][DEBUG] SSID  : '%s' (longitud: %d)\n", ssid.c_str(), ssid.length());
-    Serial.printf("[WiFi][DEBUG] PASS  : '%s' (longitud: %d)\n", password.c_str(), password.length());
+    Serial.printf("[WiFi][DEBUG] PASS  : [OCULTO] (longitud: %d)\n", password.length());
     Serial.println("=================================");
 }
 
@@ -561,6 +575,7 @@ void reconnectToWifi() {
     WiFi.persistent(false);
     wifi_manager_restoreAp();
     vTaskDelay(pdMS_TO_TICKS(500));
+    wifi_manager_applyBleCoexistence();
     WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
     
     unsigned long startTime = millis();
@@ -583,12 +598,7 @@ void reconnectToWifi() {
         Serial.printf("[WiFi] RSSI: %d dBm\n", WiFi.RSSI());
         Serial.println("=================================");
         
-        // Intentar reconectar Firebase
-        if (initFirebase()) {
-            firebaseConnected = true;
-            firebaseErrorCount = 0;
-            Serial.println("[Firebase] ✅ Reconectado tras cambio de WiFi");
-        }
+        scheduleFirebaseInit("reconnectToWifi");
     } else {
         wifiConnected = false;
         firebaseConnected = false;
@@ -616,13 +626,13 @@ void connectWiFi() {
         WiFi.disconnect(true);
         delay(500);
         
-        // Iniciar conexión
+        wifi_manager_applyBleCoexistence();
         WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
         
         // Esperar conexión con timeout más largo (60 segundos)
         unsigned long startTime = millis();
         int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && millis() - startTime < 60000) {
+        while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
             delay(500);
             Serial.print(".");
             attempts++;
@@ -631,6 +641,8 @@ void connectWiFi() {
             }
         }
         Serial.println();
+
+        wifi_manager_ensureApRunning();
 
         if (WiFi.status() == WL_CONNECTED) {
             wifiConnected = true;
@@ -672,11 +684,180 @@ void connectWiFi() {
     }
 }
 
+static TaskHandle_t s_firebaseInitTaskHandle = nullptr;
+static volatile bool pendingFirebaseReport = false;
+static bool s_firebaseBootstrapBusy = false;
+static unsigned long s_lastFirebaseBootstrapMs = 0;
+static unsigned long s_firebaseConnectMs = 0;
+static const uint32_t FIREBASE_BOOTSTRAP_MIN_INTERVAL_MS = 3000;
+static const uint32_t FIREBASE_POST_CONNECT_DELAY_MS = 5000;
+
+static bool kiln_staLinkUp() {
+    return WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0;
+}
+
+static bool firebaseRtdbOkAfterWrite();
+
+static void firebaseBootstrapTelemetry() {
+    if (s_firebaseBootstrapBusy) {
+        return;
+    }
+    if (millis() - s_lastFirebaseBootstrapMs < FIREBASE_BOOTSTRAP_MIN_INTERVAL_MS) {
+        return;
+    }
+    if (s_firebaseConnectMs > 0 &&
+        millis() - s_firebaseConnectMs < FIREBASE_POST_CONNECT_DELAY_MS) {
+        return;
+    }
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp() || wifi_manager_apStationCount() > 0) {
+        return;
+    }
+    if (!firebaseConnected || !Firebase.ready()) {
+        return;
+    }
+
+    s_firebaseBootstrapBusy = true;
+    s_lastFirebaseBootstrapMs = millis();
+    wifiConnected = true;
+
+    float tempCopy = 0.0f;
+    String estadoCopy = "DETENIDO";
+    String uidCopy;
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        tempCopy = temperaturaActual;
+        estadoCopy = estadoHorno;
+        uidCopy = userId;
+        xSemaphoreGive(xMutex);
+    }
+    if (uidCopy == "" || deviceMacAddress == "") {
+        Serial.println("[Firebase] Sin userId/MAC — esperando kiln-info");
+        s_firebaseBootstrapBusy = false;
+        return;
+    }
+    Serial.println("[Firebase] Bootstrap tras conexion STA...");
+    reportToFirebase(tempCopy, estadoCopy);
+    s_firebaseBootstrapBusy = false;
+}
+
+static void requestFirebaseBootstrap() {
+    pendingFirebaseReport = true;
+}
+
+static void runPendingFirebaseReport() {
+    if (!pendingFirebaseReport) {
+        return;
+    }
+    if (s_firebaseInitTaskHandle != nullptr) {
+        return;
+    }
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp() || wifi_manager_apStationCount() > 0) {
+        return;
+    }
+    if (!firebaseConnected || !Firebase.ready()) {
+        return;
+    }
+    if (s_firebaseConnectMs > 0 &&
+        millis() - s_firebaseConnectMs < FIREBASE_POST_CONNECT_DELAY_MS) {
+        return;
+    }
+
+    float tempCopy = 0.0f;
+    String estadoCopy = "DETENIDO";
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        tempCopy = temperaturaActual;
+        estadoCopy = estadoHorno;
+        xSemaphoreGive(xMutex);
+    }
+    pendingFirebaseReport = false;
+    Serial.println("[Firebase] Sync pendiente...");
+    reportToFirebase(tempCopy, estadoCopy);
+}
+
+static void firebaseInitTask(void* /*pv*/) {
+    while (!wifi_manager_isFirebaseSafe()) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    Serial.printf("[Firebase] Tarea init, heap: %u\n", (unsigned)ESP.getFreeHeap());
+    const bool ok = initFirebase();
+    s_firebaseInitTaskHandle = nullptr;
+    if (ok) {
+        wifiConnected = true;
+        requestFirebaseBootstrap();
+    }
+    vTaskDelete(nullptr);
+}
+
+void kiln_notifyLocalSessionComplete() {
+    needsImmediateFirebaseSync = true;
+    Serial.println("[Firebase] Sync urgente tras sesion HTTP local");
+}
+
+void kiln_onApRadioTransitionBegin() {
+    pendingFirebaseReport = false;
+    s_firebaseBootstrapBusy = false;
+    firebaseConnected = false;
+    // No basta con cerrar el socket: el contexto BearSSL queda sucio y la
+    // siguiente operacion se cuelga en br_ssl_engine_flush() (visto en abort
+    // backtraces). Reciclamos el FirebaseData entero para garantizar una
+    // sesion TLS fresca.
+    if (fbdo != nullptr) {
+        fbdo->stopWiFiClient();
+        delete fbdo;
+        fbdo = new FirebaseData();
+    }
+    Serial.println("[Firebase] FirebaseData reciclado por transicion AP/STA");
+}
+
+void processImmediateFirebaseSync() {
+    if (!needsImmediateFirebaseSync) {
+        return;
+    }
+    if (!wifi_manager_isFirebaseSafe() || wifi_manager_apStationCount() > 0) {
+        return;
+    }
+    if (!kiln_staLinkUp()) {
+        wifiConnected = false;
+        wifi_manager_requestStaReconnect();
+        return;
+    }
+    needsImmediateFirebaseSync = false;
+    wifiConnected = true;
+    if (!firebaseConnected || !Firebase.ready()) {
+        scheduleFirebaseInit("post-local-session");
+        return;
+    }
+    requestFirebaseBootstrap();
+}
+
+void scheduleFirebaseInit(const char* reason) {
+    if (firebaseConnected || s_firebaseInitTaskHandle != nullptr) {
+        return;
+    }
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp()) {
+        return;
+    }
+    Serial.printf("[Firebase] Programando init (%s), heap libre: %u\n",
+                  reason ? reason : "?", (unsigned)ESP.getFreeHeap());
+    if (xTaskCreatePinnedToCore(
+            firebaseInitTask,
+            "FirebaseInit",
+            20480,
+            nullptr,
+            2,
+            &s_firebaseInitTaskHandle,
+            0) != pdPASS) {
+        s_firebaseInitTaskHandle = nullptr;
+        Serial.println("[Firebase] ❌ No se pudo crear tarea FirebaseInit");
+    }
+}
+
 bool initFirebase() {
     Serial.println("[Firebase] =========================================");
     Serial.println("[Firebase] Iniciando conexión a Firebase...");
     Serial.printf("[Firebase] Database URL: %s\n", FIREBASE_DATABASE_URL);
     Serial.printf("[Firebase] WiFi status: %d\n", WiFi.status());
+    Serial.printf("[Firebase] Heap libre: %u (min: %u)\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
     
     if (config == nullptr || auth == nullptr || fbdo == nullptr) {
         Serial.println("[Firebase] ❌ ERROR: Objetos Firebase no inicializados");
@@ -699,6 +880,7 @@ bool initFirebase() {
         Firebase.begin(config, auth);
         Firebase.reconnectWiFi(true);
         firebaseConnected = true;
+        s_firebaseConnectMs = millis();
         Serial.println("[Firebase] =========================================");
         Serial.println("[Firebase] ✅ CONECTADO CORRECTAMENTE");
         Serial.println("[Firebase] =========================================");
@@ -714,7 +896,33 @@ bool initFirebase() {
     }
 }
 
+static bool firebaseRtdbOkAfterWrite() {
+    if (fbdo == nullptr || !Firebase.ready()) {
+        firebaseConnected = false;
+        return false;
+    }
+    const String err = fbdo->errorReason();
+    if (err.length() == 0) {
+        return true;
+    }
+    if (err.indexOf("SSL") >= 0 || err.indexOf("write") >= 0 || err.indexOf("Write") >= 0 ||
+        err.indexOf("connection") >= 0 || err.indexOf("connected") >= 0) {
+        firebaseConnected = false;
+        firebaseErrorCount++;
+        Serial.printf("[Firebase] ❌ RTDB: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+}
+
 void reportToFirebase(float temp, const String& estado) {
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp()) {
+        return;
+    }
+    if (s_firebaseConnectMs > 0 &&
+        millis() - s_firebaseConnectMs < FIREBASE_POST_CONNECT_DELAY_MS) {
+        return;
+    }
     if (!wifiConnected || !firebaseConnected) {
         static unsigned long lastSkipLog = 0;
         if (millis() - lastSkipLog >= 30000) {
@@ -759,7 +967,9 @@ void reportToFirebase(float temp, const String& estado) {
         return;
     }
 
-    if (fbdo == nullptr) return;
+    if (fbdo == nullptr) {
+        return;
+    }
     fbdo->setResponseSize(256);
     Firebase.RTDB.setwriteSizeLimit(fbdo, "tiny");
     fbdo->setBSSLBufferSize(512, 512);
@@ -769,51 +979,49 @@ void reportToFirebase(float temp, const String& estado) {
 
     // Usar método directo para cada campo (menos stack que FirebaseJson)
     Firebase.RTDB.setFloat(fbdo, (realtimePath + "/temperature").c_str(), temp);
+    if (!firebaseRtdbOkAfterWrite()) {
+        return;
+    }
     Firebase.RTDB.setString(fbdo, (realtimePath + "/status").c_str(), estado);
+    if (!firebaseRtdbOkAfterWrite()) {
+        return;
+    }
     
-    // Actualizar nombre del programa si existe
     if (localProgramName != "") {
         Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), localProgramName);
-        
-        // Enviar información de tiempo del programa si está corriendo o pausado
+        if (!firebaseRtdbOkAfterWrite()) {
+            return;
+        }
         if (estado == "CALENTANDO" || estado == "PAUSADO") {
             if (localProgramStartTime > 0) {
-                // Convertir millis a segundos (timestamp Unix)
-                unsigned long startTimeSeconds = localProgramStartTime / 1000;
+                const unsigned long startTimeSeconds = localProgramStartTime / 1000;
                 Firebase.RTDB.setInt(fbdo, (realtimePath + "/programStartTime").c_str(), startTimeSeconds);
-                
-                // Enviar duración total
-                if (localProgramTotalDuration > 0) {
-                    Firebase.RTDB.setInt(fbdo, (realtimePath + "/programTotalDuration").c_str(), localProgramTotalDuration);
+                if (!firebaseRtdbOkAfterWrite()) {
+                    return;
                 }
-                
-                // Enviar tiempo de pausa si está pausado
+                if (localProgramTotalDuration > 0) {
+                    Firebase.RTDB.setInt(fbdo, (realtimePath + "/programTotalDuration").c_str(),
+                                        localProgramTotalDuration);
+                    if (!firebaseRtdbOkAfterWrite()) {
+                        return;
+                    }
+                }
                 if (estado == "PAUSADO" && localProgramPauseTime > 0) {
-                    unsigned long pauseTimeSeconds = localProgramPauseTime / 1000;
-                    Firebase.RTDB.setInt(fbdo, (realtimePath + "/programPauseTime").c_str(), pauseTimeSeconds);
-                } else {
-                    // Si no está pausado, eliminar programPauseTime
-                    Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programPauseTime").c_str());
+                    const unsigned long pauseTimeSeconds = localProgramPauseTime / 1000;
+                    Firebase.RTDB.setInt(fbdo, (realtimePath + "/programPauseTime").c_str(),
+                                        pauseTimeSeconds);
+                    if (!firebaseRtdbOkAfterWrite()) {
+                        return;
+                    }
                 }
             }
-        } else {
-            // Si el programa no está corriendo, limpiar campos de tiempo
-            Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programStartTime").c_str());
-            Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programTotalDuration").c_str());
-            Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programPauseTime").c_str());
         }
-    } else {
-        // Si no hay programa, limpiar todos los campos relacionados
-        Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programName").c_str());
-        Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programStartTime").c_str());
-        Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programTotalDuration").c_str());
-        Firebase.RTDB.deleteNode(fbdo, (realtimePath + "/programPauseTime").c_str());
     }
 
     // Usar Firebase Server Timestamp
-    bool success = Firebase.RTDB.setTimestamp(fbdo, (realtimePath + "/timestamp").c_str());
+    const bool success = Firebase.RTDB.setTimestamp(fbdo, (realtimePath + "/timestamp").c_str());
     
-    if (success) {
+    if (success && firebaseRtdbOkAfterWrite()) {
         if (localProgramName != "") {
             Serial.printf("[Firebase] ✅ %.1f°C - Programa: %s\n", temp, localProgramName.c_str());
         } else {
@@ -822,22 +1030,26 @@ void reportToFirebase(float temp, const String& estado) {
         firebaseErrorCount = 0;  // Resetear contador de errores
     } else {
         firebaseErrorCount++;
-        if (fbdo == nullptr) return;
+        if (fbdo == nullptr) {
+            return;
+        }
         Serial.printf("[Firebase] ❌ %s (errores: %d)\n", fbdo->errorReason().c_str(), firebaseErrorCount);
         
         // Si es error de conexión o timeout, desactivar
         if (fbdo->errorReason().indexOf("timed out") >= 0 || 
-            fbdo->errorReason().indexOf("connection") >= 0) {
+            fbdo->errorReason().indexOf("connection") >= 0 ||
+            fbdo->errorReason().indexOf("SSL") >= 0 ||
+            fbdo->errorReason().indexOf("write") >= 0) {
             firebaseConnected = false;
             Serial.println("[Firebase] Desactivado - reconectará en 30s");
         }
     }
 }
 
-// Crea deviceInfo Y realtimeData cuando se recibe KILN_INFO por BLE (primera vez)
-void updateDeviceInfoFirebase() {
-    if (!wifiConnected || !firebaseConnected) {
-        return;
+// Crea deviceInfo Y realtimeData cuando se recibe KILN_INFO (BLE o HTTP kiln-info)
+bool updateDeviceInfoFirebase() {
+    if (!wifi_manager_isFirebaseSafe() || !wifiConnected || !firebaseConnected) {
+        return false;
     }
     
     String localKilnName, localKilnModel, localUserId, localDeviceMacAddress, localEstado;
@@ -858,14 +1070,16 @@ void updateDeviceInfoFirebase() {
         }
         xSemaphoreGive(xMutex);
     } else {
-        return;
+        return false;
     }
     
     if (localUserId == "" || localDeviceMacAddress == "") {
-        return;
+        return false;
     }
     
-    if (fbdo == nullptr) return;
+    if (fbdo == nullptr) {
+        return false;
+    }
     fbdo->setResponseSize(256);
     Firebase.RTDB.setwriteSizeLimit(fbdo, "tiny");
     fbdo->setBSSLBufferSize(512, 512);
@@ -894,13 +1108,31 @@ void updateDeviceInfoFirebase() {
     // Usar Firebase Server Timestamp
     bool success2 = Firebase.RTDB.setTimestamp(fbdo, (realtimePath + "/timestamp").c_str());
     
-    if (success1 && success2) {
+    if (success1 && success2 && firebaseRtdbOkAfterWrite()) {
         Serial.println("[Firebase] ✅ deviceInfo + realtimeData creados");
-    } else if (!success1 || !success2) {
-        Serial.println("[Firebase] ❌ Error en creación inicial");
-        if (fbdo == nullptr || fbdo->errorReason().indexOf("connection") >= 0) {
-            firebaseConnected = false;
-        }
+        return true;
+    }
+    Serial.println("[Firebase] ❌ Error en creación inicial");
+    if (fbdo == nullptr || fbdo->errorReason().indexOf("connection") >= 0 ||
+        fbdo->errorReason().indexOf("SSL") >= 0 || fbdo->errorReason().indexOf("write") >= 0) {
+        firebaseConnected = false;
+    }
+    return false;
+}
+
+void onStaGainedConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    if (wifi_manager_apStationCount() > 0) {
+        Serial.println("[Firebase] STA lista pero hay movil en AP — telemetria diferida");
+        return;
+    }
+    wifiConnected = true;
+
+    if (!firebaseConnected || !Firebase.ready()) {
+        scheduleFirebaseInit("onStaGainedConnection");
+        return;
     }
 }
 
@@ -917,6 +1149,7 @@ float leerTermocupla() {
     return lastValid;
 }
 
+#if SMARTKILN_ENABLE_BLE
 // -------------------- BLE CALLBACKS --------------------
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer) override {
@@ -1418,6 +1651,14 @@ void setupBLE() {
     Serial.println("=================================");
 }
 
+#else
+
+void setupBLE() {
+    Serial.println("[BLE] Deshabilitado — uso HTTP AP + STA (sin NimBLE)");
+}
+
+#endif  // SMARTKILN_ENABLE_BLE
+
 // -------------------- TAREAS --------------------
 void TaskControlHorno(void* pvParameters) {
     for (;;) {
@@ -1439,10 +1680,21 @@ void TaskComunicaciones(void* pvParameters) {
     unsigned long lastWiFiCheck = 0;
     static unsigned int loopCounter = 0;
 
-    for (;;) {
-        kiln_api_loop();
+    static unsigned long lastApCheck = 0;
+    static bool staWasConnected = false;
 
+    for (;;) {
         unsigned long now = millis();
+        wifi_manager_tick();
+        wifi_manager_prioritizeApClients();
+        processImmediateFirebaseSync();
+        runPendingFirebaseReport();
+        lastFirebaseUpdate = millis();
+
+        if (now - lastApCheck >= 30000) {
+            wifi_manager_ensureApRunning();
+            lastApCheck = now;
+        }
         loopCounter++;
         
         // Log cada 50 iteraciones (~5 segundos con delay de 100ms)
@@ -1450,158 +1702,81 @@ void TaskComunicaciones(void* pvParameters) {
             Serial.printf("[TaskCom] 🔄 Loop activo (iteración %u, tiempo: %lu ms)\n", loopCounter, now);
         }
         
-        // --- NUEVA LÓGICA: Control de WiFi basado en estado BLE ---
         if (now - lastWiFiCheck >= 5000) {
-            // Verificar si hay cliente BLE conectado
+#if SMARTKILN_ENABLE_BLE
             bool currentBleConnected = (pServer->getConnectedCount() > 0);
-            
             if (currentBleConnected && !bleClientConnected) {
-                // Cliente BLE se conectó - actualizar estado
                 bleClientConnected = true;
                 Serial.println("[BLE] 🔵 Cliente BLE detectado - suspendiendo WiFi");
             } else if (!currentBleConnected && bleClientConnected) {
-                // Cliente BLE se desconectó - actualizar estado
                 bleClientConnected = false;
                 lastBleDisconnectTime = now;
                 Serial.println("[BLE] 🔴 Cliente BLE desconectado - programando reactivación WiFi");
             }
-            
             if (bleClientConnected) {
-                // BLE activo - suspender WiFi si está conectado
-                if (wifiConnected && !wifiSuspended) {
-                    Serial.println("[WiFi] 🔄 SUSPENDIENDO WiFi para priorizar BLE");
-                    WiFi.disconnect();
+                if (!wifiSuspended) {
+                    Serial.println("[BLE] Cliente BLE — pausa STA/Firebase (AP sigue activo)");
                     wifiConnected = false;
                     firebaseConnected = false;
                     wifiSuspended = true;
-                    Serial.println("[WiFi] ✅ WiFi suspendido - solo BLE activo");
                 }
-            } else {
-                // BLE inactivo - reactivar WiFi después del delay
-                if (wifiSuspended && (now - lastBleDisconnectTime >= BLE_DISCONNECT_DELAY)) {
-                    Serial.println("[WiFi] 🔄 REACTIVANDO WiFi tras desconexión BLE");
-                    
-                    if (wifiConfigReceived && wifiSSID != "") {
-                        Serial.printf("[WiFi] Conectando a: %s\n", wifiSSID.c_str());
-                        wifi_manager_ensureApStaMode();
-                        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-                        
-                        // Timeout más largo para reconexión (30 segundos)
-                        unsigned long startTime = millis();
-                        int attempts = 0;
-                        while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-                            vTaskDelay(pdMS_TO_TICKS(500));
-                            attempts++;
-                            if (attempts % 10 == 0) {
-                                Serial.printf("[WiFi] Esperando reconexión... Estado: %d\n", WiFi.status());
-                            }
-                        }
-                        
-                        if (WiFi.status() == WL_CONNECTED) {
-                            wifiConnected = true;
-                            wifiSuspended = false;
-                            Serial.printf("[WiFi] ✅ Reactivado. IP: %s\n", WiFi.localIP().toString().c_str());
-                            
-                            // Reconectar Firebase
-                            if (initFirebase()) {
-                                firebaseConnected = true;
-                                firebaseErrorCount = 0;
-                                Serial.println("[Firebase] ✅ Reconectado tras reactivación WiFi");
-                            }
-                        } else {
-                            Serial.printf("[WiFi] ❌ Error reactivando WiFi. Estado: %d\n", WiFi.status());
-                            wifiSuspended = false; // Permitir nuevos intentos
-                        }
-                    } else {
-                        Serial.println("[WiFi] ⚠️ No hay credenciales para reactivar WiFi");
-                        wifiSuspended = false;
-                    }
+            } else if (wifiSuspended && (now - lastBleDisconnectTime >= BLE_DISCONNECT_DELAY)) {
+                wifiSuspended = false;
+                if (wifiConfigReceived && wifiSSID != "" && wifi_manager_apStationCount() == 0) {
+                    Serial.println("[WiFi] Reactivación STA tras BLE (no bloqueante)");
+                    wifi_manager_ensureApStaMode();
+                    wifi_manager_ensureApRunning();
+                    wifi_manager_requestStaReconnect();
                 }
             }
-            
-            // Verificar conexión WiFi normal (solo si no está suspendido)
-            if (!wifiSuspended && WiFi.status() != WL_CONNECTED && wifiConfigReceived) {
-                if (wifiConnected) {
-                    Serial.println("[WiFi] ⚠️ Conexión perdida, intentando reconectar...");
-                    wifiConnected = false;
-                    firebaseConnected = false;
-                }
-                
-                Serial.printf("[WiFi] Reconectando a: %s\n", wifiSSID.c_str());
-                wifi_manager_ensureApStaMode();
-                WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-                
-                // Timeout más largo para reconexión (30 segundos)
-                unsigned long startTime = millis();
-                int attempts = 0;
-                while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    attempts++;
-                    if (attempts % 10 == 0) {
-                        Serial.printf("[WiFi] Esperando reconexión... Estado: %d\n", WiFi.status());
-                    }
-                }
-                
-                if (WiFi.status() == WL_CONNECTED) {
+#endif
+            // STA: reconexión NO bloqueante y solo sin clientes en el AP (no interferir HTTP)
+            static unsigned long lastStaReconnectAttempt = 0;
+            const bool apHasPhone = (wifi_manager_apStationCount() > 0);
+            if (!wifiSuspended && !apHasPhone && !bleClientConnected && !kiln_staLinkUp() &&
+                wifi_manager_isFirebaseSafe() && wifiConfigReceived && wifiSSID.length() > 0 &&
+                (now - lastStaReconnectAttempt >= 30000)) {
+                lastStaReconnectAttempt = now;
+                Serial.printf("[WiFi] Intento STA en segundo plano: %s\n", wifiSSID.c_str());
+                wifi_manager_requestStaReconnect();
+            }
+            const bool staNow = kiln_staLinkUp();
+            if (!wifiSuspended && staNow) {
+                if (!wifiConnected) {
                     wifiConnected = true;
-                    Serial.printf("[WiFi] ✅ Reconectado. IP: %s, RSSI: %d dBm\n", 
-                                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
-                    
-                    if (initFirebase()) {
-                        firebaseConnected = true;
-                        firebaseErrorCount = 0;
-                        Serial.println("[Firebase] ✅ Reconectado");
-                    }
-                } else {
-                    int wifiStatus = WiFi.status();
-                    Serial.printf("[WiFi] ❌ No se pudo reconectar. Estado: %d\n", wifiStatus);
-                    const char* statusMsg = "";
-                    switch(wifiStatus) {
-                        case WL_IDLE_STATUS: statusMsg = "WL_IDLE_STATUS (0)"; break;
-                        case WL_NO_SSID_AVAIL: statusMsg = "WL_NO_SSID_AVAIL (1) - SSID no encontrado"; break;
-                        case WL_CONNECT_FAILED: statusMsg = "WL_CONNECT_FAILED (4) - Falló la conexión"; break;
-                        case WL_CONNECTION_LOST: statusMsg = "WL_CONNECTION_LOST (5) - Conexión perdida"; break;
-                        case WL_DISCONNECTED: statusMsg = "WL_DISCONNECTED (6) - Desconectado"; break;
-                        default: statusMsg = "Estado desconocido"; break;
-                    }
-                    Serial.printf("[WiFi] Estado: %s\n", statusMsg);
+                    Serial.printf("[WiFi] STA conectada. IP: %s\n", WiFi.localIP().toString().c_str());
                 }
-            } else if (!wifiSuspended && WiFi.status() == WL_CONNECTED && !wifiConnected) {
-                wifiConnected = true;
-                Serial.printf("[WiFi] ✅ Conexión restaurada. IP: %s\n", WiFi.localIP().toString().c_str());
+                if (!staWasConnected) {
+                    onStaGainedConnection();
+                }
+            } else if (!wifiSuspended) {
+                wifiConnected = false;
             }
-            
+            staWasConnected = staNow && !wifiSuspended;
+
             lastWiFiCheck = now;
         }
         
-        // --- Reconectar Firebase si es necesario (cada 30 seg) ---
-        if (!firebaseConnected && wifiConnected && (now - lastFirebaseReconnect >= 30000)) {
-            Serial.println("[Firebase] Intentando reconectar...");
-            if (initFirebase()) {
-                firebaseErrorCount = 0;  // Resetear contador de errores
-                Serial.println("[Firebase] ✅ Reconectado");
-            }
+        if (!firebaseConnected && kiln_staLinkUp() && (now - lastFirebaseReconnect >= 30000)) {
+            wifiConnected = true;
+            scheduleFirebaseInit("reconnect-periodic");
             lastFirebaseReconnect = now;
         }
 
-        // --- BLE: Actualización cada 1 seg (no bloqueante) ---
+#if SMARTKILN_ENABLE_BLE
         if (now - lastBLEUpdate >= 1000) {
-            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {  // Timeout reducido
+            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 if (pServer->getConnectedCount() > 0) {
                     gTempChar->setValue(temperaturaActual);
                     gTempChar->notify();
                     gStatusChar->setValue(estadoHorno);
                     gStatusChar->notify();
-
-                    // Log cada ~10 s para confirmar envío por serial (no cada 1 s para no saturar)
                     static unsigned long lastBleLog = 0;
                     if (now - lastBleLog >= 10000) {
                         Serial.printf("[BLE] 📤 Enviando temp=%.1f°C, estado=%s (cada 1 s)\n",
                                       temperaturaActual, estadoHorno.c_str());
                         lastBleLog = now;
                     }
-
-                    // Notificar nombre del programa si existe
                     if (gProgramNameChar != nullptr && strlen(curvaActual.nombre) > 0) {
                         gProgramNameChar->setValue(String(curvaActual.nombre));
                         gProgramNameChar->notify();
@@ -1611,16 +1786,18 @@ void TaskComunicaciones(void* pvParameters) {
             }
             lastBLEUpdate = now;
         }
+#endif
 
-        // --- Verificación de Advertising cada 10 seg ---
         if (now - lastAdvertisingCheck >= 10000) {
             if (statusLogsEnabled) {
                 Serial.println("=================================");
+#if SMARTKILN_ENABLE_BLE
                 Serial.println("[BLE] 🔍 VERIFICACIÓN PERIÓDICA DE ADVERTISING:");
                 Serial.printf("[BLE] Advertising activo: %s\n", pServer->getAdvertising()->isAdvertising() ? "SÍ" : "NO");
                 Serial.printf("[BLE] Dispositivos conectados: %d\n", pServer->getConnectedCount());
                 Serial.printf("[BLE] Estado BLE: %s\n", bleClientConnected ? "CONECTADO" : "DESCONECTADO");
                 Serial.println("=================================");
+#endif
                 Serial.println("[WiFi] 📶 ESTADO DE CONEXIÓN WiFi:");
                 Serial.printf("[WiFi] wifiConfigReceived: %s\n", wifiConfigReceived ? "SÍ" : "NO");
                 if (wifiConfigReceived) {
@@ -1642,17 +1819,12 @@ void TaskComunicaciones(void* pvParameters) {
             lastAdvertisingCheck = now;
         }
 
-        // --- Verificar si necesita actualizar deviceInfo (cuando se recibe KILN_INFO) ---
-        if (needsDeviceInfoUpdate && wifiConnected && firebaseConnected) {
-            Serial.println("[Firebase] Flag detectada - actualizando deviceInfo...");
-            
-            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // --- deviceInfo + realtimeData tras kiln-info (cuando STA/Firebase listos) ---
+        if (needsDeviceInfoUpdate && wifiConnected && firebaseConnected && !wifiSuspended) {
+            Serial.println("[Firebase] Flag detectada - sincronizando deviceInfo + realtimeData...");
+            if (updateDeviceInfoFirebase()) {
                 needsDeviceInfoUpdate = false;
-                xSemaphoreGive(xMutex);
-                
-                vTaskDelay(pdMS_TO_TICKS(10));
-                updateDeviceInfoFirebase();
-                Serial.println("[Firebase] deviceInfo actualizado desde KILN_INFO");
+                Serial.println("[Firebase] Sincronizacion inicial OK");
             }
         }
 
@@ -1692,63 +1864,39 @@ void TaskComunicaciones(void* pvParameters) {
             }
         }
         
-        // --- Firebase: Envío cada 5 seg (solo si WiFi no está suspendido) ---
-        if (now - lastFirebaseUpdate >= 5000) {
-            Serial.printf("[TaskCom] 🔍 Verificando Firebase update: wifiConnected=%s, firebaseConnected=%s, wifiSuspended=%s\n",
-                         wifiConnected ? "SÍ" : "NO",
-                         firebaseConnected ? "SÍ" : "NO",
-                         wifiSuspended ? "SÍ" : "NO");
-            
-            if (wifiConnected && firebaseConnected && !wifiSuspended) {
+        // --- Firebase por STA (no mientras el movil usa el AP: libera radio para HTTP) ---
+        const bool staReady = kiln_staLinkUp();
+        const bool apHasPhone = (wifi_manager_apStationCount() > 0);
+        if (!staReady && !wifiSuspended) {
+            wifiConnected = false;
+        }
+        if (staReady && !wifiSuspended && !apHasPhone && wifi_manager_isFirebaseSafe() &&
+            s_firebaseInitTaskHandle == nullptr &&
+            (s_firebaseConnectMs == 0 ||
+             millis() - s_firebaseConnectMs >= FIREBASE_POST_CONNECT_DELAY_MS) &&
+            now - lastFirebaseUpdate >= 5000) {
+            wifiConnected = true;
+            if (!firebaseConnected) {
+                scheduleFirebaseInit("sta-loop");
+            }
+            if (firebaseConnected && Firebase.ready()) {
                 float tempCopy = 0;
                 String estadoCopy = "";
                 String userIdCopy = "";
-                
-                Serial.println("[TaskCom] ✅ Condiciones cumplidas, intentando tomar mutex...");
                 
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     tempCopy = temperaturaActual;
                     estadoCopy = estadoHorno;
                     userIdCopy = userId;
                     xSemaphoreGive(xMutex);
-                    
-                    Serial.printf("[TaskCom] 📊 Datos copiados: temp=%.1f°C, estado=%s, userId=%s\n",
-                                 tempCopy, estadoCopy.c_str(), userIdCopy.length() > 0 ? userIdCopy.c_str() : "VACÍO");
-                    
-                    // Yields múltiples para resetear WDT antes y después de Firebase
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    
-                    // Verificar Firebase.ready() antes de enviar
-                    bool firebaseReady = Firebase.ready();
-                    Serial.printf("[TaskCom] 🔥 Firebase.ready() = %s\n", firebaseReady ? "TRUE" : "FALSE");
-                    
-                    // Enviar solo si tenemos userId
-                    if (userIdCopy != "") {
-                        if (firebaseReady) {
-                            Serial.printf("[Firebase] 📤 Enviando datos: temp=%.1f°C, estado=%s, userId=%s\n", 
-                                         tempCopy, estadoCopy.c_str(), userIdCopy.c_str());
-                            reportToFirebase(tempCopy, estadoCopy);
-                            vTaskDelay(pdMS_TO_TICKS(50));  // Yield adicional después de Firebase
-                        } else {
-                            Serial.println("[Firebase] ⚠️ Firebase no está listo (token/cliente no válido)");
-                        }
-                    } else {
-                        Serial.println("[Firebase] ⚠️ No se puede actualizar: userId vacío (esperando desde app BLE)");
+
+                    if (userIdCopy != "" && deviceMacAddress != "") {
+                        reportToFirebase(tempCopy, estadoCopy);
                     }
-                } else {
-                    Serial.println("[TaskCom] ❌ No se pudo tomar mutex para Firebase update");
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    continue;
                 }
-            } else {
-                Serial.printf("[Firebase] ⚠️ Condiciones no cumplidas: wifiConnected=%s, firebaseConnected=%s, wifiSuspended=%s\n",
-                             wifiConnected ? "SÍ" : "NO",
-                             firebaseConnected ? "SÍ" : "NO",
-                             wifiSuspended ? "SÍ" : "NO");
             }
             lastFirebaseUpdate = now;
         } else if (wifiSuspended) {
-            // WiFi suspendido - solo actualizar timestamp para evitar envíos
             lastFirebaseUpdate = now;
         }
 
@@ -1792,21 +1940,43 @@ void TaskControlCurva(void* pvParameters) {
         
         Serial.printf("[Curva] Duración total calculada: %d minutos\n", totalDurationMinutes);
         
-        for (int i = 0; i < curvaActual.numSegmentos; i++) {
+        bool aborted = false;
+        for (int i = 0; i < curvaActual.numSegmentos && !aborted; i++) {
             Segmento seg = curvaActual.segmentos[i];
             Serial.printf("[Curva] Segmento %d / %d: T=%.1f, R=%.1f, M=%d\n",
                           i + 1, curvaActual.numSegmentos,
                           seg.tempObjetivo, seg.rampaCporMin, seg.tiempoRemojoMin);
 
             // --- Rampa ---
-            float tempLocal;
+            float tempLocal = 0.0f;
             if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 tempLocal = temperaturaActual;
                 xSemaphoreGive(xMutex);
             }
 
             float rampaPorSegundo = seg.rampaCporMin / 60.0;
-            while (tempLocal < seg.tempObjetivo && estadoHorno == "CALENTANDO") {
+            while (tempLocal < seg.tempObjetivo) {
+                String estadoLocal;
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    estadoLocal = estadoHorno;
+                    xSemaphoreGive(xMutex);
+                }
+
+                if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
+                    aborted = true;
+                    break;
+                }
+                if (estadoLocal == "PAUSADO") {
+                    // Pausa: esperar sin avanzar la rampa.
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+                if (estadoLocal != "CALENTANDO") {
+                    // Estado transitorio: esperar y reevaluar.
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+
                 tempLocal += rampaPorSegundo;  // Simulación
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     temperaturaActual = tempLocal;
@@ -1814,24 +1984,53 @@ void TaskControlCurva(void* pvParameters) {
                 }
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
+            if (aborted) break;
 
             // --- Remojo ---
-            unsigned long inicioRemojo = millis();
-            while ((millis() - inicioRemojo) < (unsigned long)seg.tiempoRemojoMin * 60000UL
-                   && estadoHorno == "CALENTANDO") {
+            // Tiempo acumulado solo cuando está en CALENTANDO. Así una pausa
+            // larga no se descuenta del remojo y al reanudar termina con la
+            // duración correcta.
+            unsigned long tiempoAcumuladoMs = 0;
+            unsigned long objetivoMs = (unsigned long)seg.tiempoRemojoMin * 60000UL;
+            while (tiempoAcumuladoMs < objetivoMs) {
+                String estadoLocal;
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    estadoLocal = estadoHorno;
+                    xSemaphoreGive(xMutex);
+                }
+
+                if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
+                    aborted = true;
+                    break;
+                }
+                if (estadoLocal == "PAUSADO") {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+                if (estadoLocal != "CALENTANDO") {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    continue;
+                }
+
+                tiempoAcumuladoMs += 1000;
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
 
-        // --- Finalización ---
+        // --- Cierre del programa ---
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            estadoHorno = "FINALIZADO";
+            if (aborted) {
+                // No tocamos estadoHorno: el handler ya lo puso en DETENIDO.
+                Serial.println("[Curva] Programa abortado por STOP.");
+            } else {
+                estadoHorno = "FINALIZADO";
+                Serial.println("[Curva] Programa finalizado normalmente.");
+            }
             curvaActual.recibida = false;
             programStartTime = 0;  // Resetear timestamp de inicio
             programPauseTime = 0;  // Resetear timestamp de pausa
             xSemaphoreGive(xMutex);
         }
-        Serial.println("[Curva] Finalizada.");
     }
 }
 
@@ -1998,6 +2197,7 @@ void setup() {
     // Configurar niveles de log DESPUÉS de que Serial esté funcionando
     esp_log_level_set("*", ESP_LOG_NONE);
     esp_log_level_set("Preferences", ESP_LOG_NONE);
+#if SMARTKILN_ENABLE_BLE
     esp_log_level_set("NimBLEDevice", ESP_LOG_NONE);
     esp_log_level_set("NimBLEServer", ESP_LOG_NONE);
     esp_log_level_set("NimBLEService", ESP_LOG_NONE);
@@ -2006,6 +2206,7 @@ void setup() {
     esp_log_level_set("NimBLEClient", ESP_LOG_NONE);
     esp_log_level_set("NimBLEScan", ESP_LOG_NONE);
     esp_log_level_set("NimBLEUtils", ESP_LOG_NONE);
+#endif
     esp_log_level_set("wifi", ESP_LOG_ERROR);
     esp_log_level_set("phy_init", ESP_LOG_ERROR);
     
@@ -2031,6 +2232,7 @@ void setup() {
 
     wifi_manager_begin(deviceMacAddress);
     kiln_api_begin();
+    kiln_api_startTask();
     delay(50);
 
     // NUEVO: Cargar datos del horno guardados
@@ -2075,33 +2277,28 @@ void setup() {
     xMutex = xSemaphoreCreateMutex();
     
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    // Intentar conectar WiFi si hay credenciales guardadas
-    connectWiFi();
+    // STA/ERNet en segundo plano (TaskCom) — no tocar el AP aquí
+    wifiConnected = false;
+    Serial.println("[SETUP] AP listo; STA/Firebase diferidos (sin bloquear HTTP)");
+
+    Serial.println("\n[SETUP] Firebase se iniciara cuando STA conecte (sin bloquear AP)");
     
-    if (wifiConnected) {
-        Serial.println("\n[SETUP] =========================================");
-        Serial.println("[SETUP] INTENTANDO CONECTAR Firebase...");
-        Serial.println("[SETUP] =========================================");
-        initFirebase();
-    } else {
-        Serial.println("\n[SETUP] ⚠️ WiFi no conectado - Firebase no se inicializará");
-    }
-    
-    Serial.println("\n[SETUP] =========================================");
-    Serial.println("[SETUP] INICIANDO BLE...");
-    Serial.println("[SETUP] =========================================");
     setupBLE();
-    
-    Serial.println("\n[SETUP] =========================================");
-    Serial.println("[SETUP] ✅ SETUP COMPLETADO");
-    Serial.println("[SETUP] =========================================");
-    Serial.println("\n");
-    
-    // NUEVO: Enviar nombre del programa cargado por BLE si existe
+#if SMARTKILN_ENABLE_BLE
+    wifi_manager_applyBleCoexistence();
+    Serial.println("[WiFi] Modem sleep activado (coexistencia BLE+WiFi)");
     if (strlen(curvaActual.nombre) > 0 && gProgramNameChar != nullptr) {
         gProgramNameChar->setValue(String(curvaActual.nombre));
         Serial.printf("[BLE] ✅ Nombre del programa inicial enviado: %s\n", curvaActual.nombre);
     }
+#else
+    Serial.println("[SETUP] NimBLE no compilado — mas heap para WiFi/Firebase");
+#endif
+
+    Serial.println("\n[SETUP] =========================================");
+    Serial.println("[SETUP] ✅ SETUP COMPLETADO");
+    Serial.println("[SETUP] =========================================");
+    Serial.println("\n");
 
     // Inicializar pantalla LVGL (solo para ESP32-S3)
     // Retrasar inicialización para asegurar que todo lo demás esté listo
@@ -2129,11 +2326,22 @@ void setup() {
     #endif
 
     xTaskCreatePinnedToCore(TaskControlHorno, "ControlHorno", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(TaskComunicaciones, "Comunicaciones", 10240, NULL, 1, NULL, 0);
+    // TaskCom (Firebase + WiFi reconexion) corre en core 1 para no bloquear al
+    // wifi_event_task ni al IdleTask de core 0. Un setFloat colgado por SSL
+    // muerta dispararia task_wdt_isr en core 0 (visto en abort backtraces).
+    xTaskCreatePinnedToCore(TaskComunicaciones, "Comunicaciones", 24576, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(TaskControlCurva, "ControlCurva", 6144, NULL, 1, NULL, 1);
+
+    // Subimos el Task Watchdog a 30 s y desactivamos el panic. Las operaciones
+    // Firebase pueden colgarse temporalmente si el socket TLS queda corrupto
+    // tras una transicion AP/STA; preferimos un timeout limpio en la lib en
+    // lugar de un reboot. esp_task_wdt_init es idempotente.
+    esp_task_wdt_init(30, false);
 }
 
 void loop() {
+    kiln_api_loop();
+
     // Heartbeat periódico para mantener Serial activo (cada 30 segundos)
     static unsigned long lastHeartbeat = 0;
     unsigned long now = millis();

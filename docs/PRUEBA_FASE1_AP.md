@@ -28,9 +28,20 @@ Busca:
 
 ## En el teléfono
 
-1. Ajustes → WiFi → red **SmartKiln-XXXX** (password del log).
-2. Navegador → `http://192.168.4.1/api/status` → JSON con temperatura.
-3. `http://192.168.4.1/api/ap-info` → SSID/password para QR futuro.
+1. **Desactiva datos móviles (4G)**.
+2. WiFi → **SmartKiln-XXXX** (password del log).
+3. Si dice *Sin internet* → **Mantener conexión** / **Usar igualmente**.
+4. En la **barra de direcciones** del navegador (no el buscador):
+   - `http://192.168.4.1/api/status` → JSON
+   - o `http://192.168.4.1/` → página con enlaces
+5. Debe ser **http**, nunca **https**.
+
+### Si dice «No se puede acceder a este sitio»
+
+- En detalles del WiFi SmartKiln: **Puerta de enlace = 192.168.4.1**, IP del móvil `192.168.4.x` (no `169.254…`).
+- **DNS privado: Desactivado** (Ajustes WiFi → SmartKiln).
+- Prueba Firefox o Samsung Internet.
+- Sube el firmware actualizado (mejoras AP + portal cautivo).
 
 ## Probar comando START
 

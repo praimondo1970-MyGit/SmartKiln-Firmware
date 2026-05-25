@@ -14,3 +14,6 @@ bool kiln_applyKilnInfoJson(const String& jsonStr, String& errorOut);
 String kiln_buildStatusJson();
 String kiln_buildInfoJson();
 String kiln_buildApInfoJson();
+
+/** Tras HTTP local (perfil, START, kiln-info): libera AP y marca sync Firebase. */
+void kiln_onLocalSessionEnd(const char* reason);

@@ -69,6 +69,15 @@ O formato WiFi estándar: `WIFI:T:WPA;S:SmartKiln-A1B2;P:xxxxxxxx;;`
 - [x] Contraseña AP: últimos 8 caracteres del MAC
 - [x] AP+STA en Fase 1 (BLE sigue hasta Fase 3)
 - [x] Endpoints: status, command, profile, kiln-info, ap-info
+- [x] **Ciclo AP tras sesión local**: tras `command` / `profile` / `kiln-info` → AP off ~10 s (móvil vuelve a casa) → AP on de nuevo
+
+### Ciclo liberación AP (firmware)
+
+1. Tras POST exitoso local: `wifi_manager_requestApRelease()` (gracia 2.5 s).
+2. `softAPdisconnect` → STA a red de casa si hay credenciales en NVS.
+3. ~10 s sin AP → Firebase activo (`apStationCount == 0`).
+4. `restoreApAfterRelease()` → `SmartKiln-XXXX` disponible otra vez (solo AP; STA cuando no hay móvil en el AP).
+5. Si el móvil sigue en el AP tras guardar, la liberación se pospone hasta que se desconecte.
 
 ## Prueba Fase 1 (sin app)
 
