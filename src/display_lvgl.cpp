@@ -573,6 +573,10 @@ void updateDisplayData(const DisplayData& data) {
         strncpy(statusText, "finalizado", sizeof(statusText) - 1);
         statusText[sizeof(statusText) - 1] = '\0';
         lv_obj_set_style_text_color(labelStatusText, lv_color_hex(0x00FF00), LV_PART_MAIN);  // Verde
+    } else if (strcmp(data.status, "INTERRUMPIDO") == 0) {
+        strncpy(statusText, "interrumpido", sizeof(statusText) - 1);
+        statusText[sizeof(statusText) - 1] = '\0';
+        lv_obj_set_style_text_color(labelStatusText, lv_color_hex(0xFF8800), LV_PART_MAIN);
     } else {
         strncpy(statusText, "inactivo", sizeof(statusText) - 1);
         statusText[sizeof(statusText) - 1] = '\0';

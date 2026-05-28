@@ -124,6 +124,7 @@ String estadoHorno = "IDLE";
 bool wifiConnected = false;
 bool firebaseConnected = false;
 bool needsDeviceInfoUpdate = false;  // Flag para actualizar deviceInfo desde tarea
+bool needsBootRealtimePublish = false;  // Publicar estado real al conectar Firebase tras boot
 unsigned int firebaseErrorCount = 0;  // Contador de errores consecutivos
 
 String deviceMacAddress = "";
@@ -157,6 +158,28 @@ Preferences preferences;
 unsigned long programStartTime = 0;  // Timestamp de inicio del programa (en millis)
 unsigned long programPauseTime = 0;  // Timestamp de última pausa (en millis)
 int programTotalDurationMinutes = 0;  // Duración total del programa en minutos
+
+// --------------------------------------------------------------------
+// Estado de ejecución persistido (para sobrevivir a un reinicio del ESP)
+// --------------------------------------------------------------------
+// Estos valores se guardan en NVS (namespace "run_state") cada vez que el
+// programa avanza de fase/segmento. Al boot, si encontramos un estado
+// CALENTANDO o PAUSADO previo, marcamos estadoHorno = "INTERRUMPIDO" y la
+// app le ofrece al usuario reanudar (RESUME) o cancelar (STOP).
+//
+// runCurrentSegment: índice del segmento en el que iba el programa cuando
+//                    se cortó la luz; -1 = no había programa en marcha.
+// runCurrentPhase  : "RAMPA" o "REMOJO" dentro del segmento actual.
+// runSoakAccumMs   : ms acumulados en la fase de remojo del segmento
+//                    actual (0 cuando estamos en rampa).
+volatile int runCurrentSegment = -1;
+String runCurrentPhase = "";
+volatile unsigned long runSoakAccumMs = 0;
+// resumeFromSavedState arranca en true si en setup() detectamos que había
+// una cocción interrumpida; TaskControlCurva lo lee al disparar la rampa
+// para empezar desde runCurrentSegment + runCurrentPhase + runSoakAccumMs
+// en vez de hacerlo desde cero.
+volatile bool resumeFromSavedState = false;
 
 
 // CurvaActiva / Segmento en kiln_shared.h
@@ -541,6 +564,92 @@ void loadProfile() {
         Serial.println("[STORAGE] ❌ Segmentos inválidos, limpiando perfil");
         memset(&curvaActual, 0, sizeof(CurvaActiva));
     }
+}
+
+// --------------------------------------------------------------------
+// Persistencia del estado de ejecución (run_state)
+// --------------------------------------------------------------------
+// Guardamos: estado actual del horno, segmento en curso, fase (RAMPA|REMOJO),
+// ms acumulados en remojo y la temperatura simulada al momento de persistir.
+// Se llama desde TaskControlCurva al cambiar de segmento/fase y desde los
+// handlers de START/PAUSE para grabar el estado nuevo. Se borra al
+// terminar (FINALIZADO), detener (DETENIDO/STOP) o cuando el usuario
+// cancela un programa interrumpido.
+void saveRunState(const String& estado,
+                  int segmentIdx,
+                  const String& phase,
+                  unsigned long soakAccumMs,
+                  float tempSnapshot) {
+    preferences.begin("run_state", false);
+    preferences.putString("estado", estado);
+    preferences.putInt("segIdx", segmentIdx);
+    preferences.putString("phase", phase);
+    preferences.putULong("soakMs", soakAccumMs);
+    preferences.putFloat("temp", tempSnapshot);
+    preferences.end();
+    Serial.printf("[RunState] saved: estado=%s seg=%d phase=%s soakMs=%lu temp=%.1f\n",
+                  estado.c_str(), segmentIdx, phase.c_str(), soakAccumMs, tempSnapshot);
+}
+
+void clearRunState() {
+    preferences.begin("run_state", false);
+    preferences.clear();
+    preferences.end();
+    runCurrentSegment = -1;
+    runCurrentPhase = "";
+    runSoakAccumMs = 0;
+    resumeFromSavedState = false;
+    Serial.println("[RunState] cleared");
+}
+
+// Lee el run_state guardado y, si encontramos un estado CALENTANDO o
+// PAUSADO previo, deja estadoHorno = "INTERRUMPIDO" para que la app le
+// pregunte al usuario qué hacer. Si no había nada (o era un estado
+// terminal) NO toca estadoHorno y lo deja en su default ("IDLE").
+void loadRunState() {
+    preferences.begin("run_state", true);  // read-only
+    String estadoPrev = preferences.getString("estado", "");
+    int segIdx = preferences.getInt("segIdx", -1);
+    String phase = preferences.getString("phase", "");
+    unsigned long soakMs = preferences.getULong("soakMs", 0UL);
+    float tempPrev = preferences.getFloat("temp", 0.0f);
+    preferences.end();
+
+    Serial.printf("[RunState] loaded: estado=%s seg=%d phase=%s soakMs=%lu temp=%.1f\n",
+                  estadoPrev.c_str(), segIdx, phase.c_str(), soakMs, tempPrev);
+
+    // Solo CALENTANDO o PAUSADO se consideran "interrumpidos". El resto
+    // se ignora porque el horno ya estaba parado/listo antes del corte.
+    if (estadoPrev != "CALENTANDO" && estadoPrev != "PAUSADO") {
+        return;
+    }
+    if (!curvaActual.recibida || curvaActual.numSegmentos <= 0) {
+        // No hay programa cargado para reanudar; descartamos el run_state.
+        Serial.println("[RunState] sin programa cargado: ignorando run_state");
+        clearRunState();
+        return;
+    }
+    if (segIdx < 0 || segIdx >= curvaActual.numSegmentos) {
+        Serial.println("[RunState] segIdx fuera de rango: ignorando");
+        clearRunState();
+        return;
+    }
+    if (phase != "RAMPA" && phase != "REMOJO") {
+        Serial.println("[RunState] phase inválida: ignorando");
+        clearRunState();
+        return;
+    }
+
+    runCurrentSegment = segIdx;
+    runCurrentPhase = phase;
+    runSoakAccumMs = soakMs;
+    if (tempPrev > 0.0f && tempPrev < 1500.0f) {
+        temperaturaActual = tempPrev;
+    }
+    resumeFromSavedState = true;
+    estadoHorno = "INTERRUMPIDO";
+    Serial.printf("[RunState] *** Cocción interrumpida detectada (seg %d, %s) → estadoHorno=INTERRUMPIDO\n",
+                  segIdx + 1, phase.c_str());
 }
 
 void reconnectToWifi() {
@@ -987,7 +1096,15 @@ void reportToFirebase(float temp, const String& estado) {
         return;
     }
     
-    if (localProgramName != "") {
+    const bool activeRun = (estado == "CALENTANDO" || estado == "PAUSADO");
+    if (!activeRun) {
+        // IDLE / INTERRUMPIDO / DETENIDO / FINALIZADO: limpiar nombre en RTDB
+        // para que la app no infiera "Horneando" por programName obsoleto.
+        Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), "");
+        if (!firebaseRtdbOkAfterWrite()) {
+            return;
+        }
+    } else if (localProgramName != "") {
         Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), localProgramName);
         if (!firebaseRtdbOkAfterWrite()) {
             return;
@@ -1271,10 +1388,11 @@ class CommandCallback : public NimBLECharacteristicCallbacks {
                 Serial.println("[CMD] Programa pausado");
             }
             else if (cmd == "STOP") {
-                estadoHorno = "DETENIDO";
+                estadoHorno = "IDLE";
                 programStartTime = 0;
                 programPauseTime = 0;
-                Serial.println("[CMD] Programa detenido");
+                clearRunState();
+                Serial.println("[CMD] Programa detenido → IDLE");
             }
             else if (cmd == "TEST") {
                 Serial.println("[CMD] ✅ Comando TEST recibido correctamente");
@@ -1873,17 +1991,21 @@ void TaskComunicaciones(void* pvParameters) {
         if (staReady && !wifiSuspended && !apHasPhone && wifi_manager_isFirebaseSafe() &&
             s_firebaseInitTaskHandle == nullptr &&
             (s_firebaseConnectMs == 0 ||
-             millis() - s_firebaseConnectMs >= FIREBASE_POST_CONNECT_DELAY_MS) &&
-            now - lastFirebaseUpdate >= 5000) {
+             millis() - s_firebaseConnectMs >= FIREBASE_POST_CONNECT_DELAY_MS)) {
             wifiConnected = true;
             if (!firebaseConnected) {
                 scheduleFirebaseInit("sta-loop");
             }
-            if (firebaseConnected && Firebase.ready()) {
+            const bool firebaseReady = firebaseConnected && Firebase.ready();
+            const bool duePeriodic =
+                (now - lastFirebaseUpdate >= 5000);
+            const bool dueBoot = needsBootRealtimePublish && firebaseReady;
+
+            if (firebaseReady && (dueBoot || duePeriodic)) {
                 float tempCopy = 0;
                 String estadoCopy = "";
                 String userIdCopy = "";
-                
+
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     tempCopy = temperaturaActual;
                     estadoCopy = estadoHorno;
@@ -1892,10 +2014,15 @@ void TaskComunicaciones(void* pvParameters) {
 
                     if (userIdCopy != "" && deviceMacAddress != "") {
                         reportToFirebase(tempCopy, estadoCopy);
+                        if (dueBoot) {
+                            needsBootRealtimePublish = false;
+                            Serial.printf("[Firebase] Boot sync: status=%s\n",
+                                            estadoCopy.c_str());
+                        }
                     }
                 }
+                lastFirebaseUpdate = now;
             }
-            lastFirebaseUpdate = now;
         } else if (wifiSuspended) {
             lastFirebaseUpdate = now;
         }
@@ -1918,8 +2045,22 @@ void TaskControlCurva(void* pvParameters) {
             }
         }
 
-        Serial.println("[Curva] Iniciando ejecución...");
-        
+        // ¿Estamos arrancando una cocción nueva o reanudando una interrumpida?
+        bool resume = resumeFromSavedState;
+        int startSegmentIdx = 0;
+        String startPhase = "RAMPA";
+        unsigned long startSoakMs = 0;
+        if (resume) {
+            startSegmentIdx = (int)runCurrentSegment;
+            startPhase = runCurrentPhase;
+            startSoakMs = runSoakAccumMs;
+            resumeFromSavedState = false;
+            Serial.printf("[Curva] *** Reanudando desde segmento %d, fase %s, remojo acumulado %lu ms\n",
+                          startSegmentIdx + 1, startPhase.c_str(), startSoakMs);
+        } else {
+            Serial.println("[Curva] Iniciando ejecución desde cero...");
+        }
+
         // Obtener temperatura inicial y calcular duración total
         float initialTemp = 0.0;
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -1930,68 +2071,136 @@ void TaskControlCurva(void* pvParameters) {
         // Calcular duración total usando función auxiliar
         int totalDurationMinutes = calculateProgramTotalDuration(initialTemp);
         
-        // Guardar timestamp de inicio y duración total
+        // Guardar timestamp de inicio y duración total. En el caso de un
+        // resume preservamos programStartTime si ya estaba seteado en el
+        // boot anterior; si no, lo arrancamos ahora (el progreso "exacto"
+        // de tiempo total se pierde con el corte, pero los tramos en sí
+        // (segmentos, rampa hasta tempObjetivo y remojo restante) se
+        // respetan, que es la garantía importante de la cocción).
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            programStartTime = millis();
+            if (!resume || programStartTime == 0) {
+                programStartTime = millis();
+            }
             programTotalDurationMinutes = totalDurationMinutes;
             programPauseTime = 0;  // Resetear tiempo de pausa
             xSemaphoreGive(xMutex);
         }
         
         Serial.printf("[Curva] Duración total calculada: %d minutos\n", totalDurationMinutes);
-        
+
+        // Persistir estado inicial (el run_state cubre tanto el primer
+        // arranque como la reanudación: si se vuelve a cortar la luz,
+        // recuperamos el segmento/fase actual del NVS).
+        {
+            String estadoCopy;
+            float tempCopy = 0.0f;
+            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                estadoCopy = estadoHorno;
+                tempCopy = temperaturaActual;
+                xSemaphoreGive(xMutex);
+            }
+            runCurrentSegment = startSegmentIdx;
+            runCurrentPhase = startPhase;
+            runSoakAccumMs = startSoakMs;
+            saveRunState(estadoCopy, startSegmentIdx, startPhase, startSoakMs, tempCopy);
+        }
+
         bool aborted = false;
-        for (int i = 0; i < curvaActual.numSegmentos && !aborted; i++) {
+        for (int i = startSegmentIdx; i < curvaActual.numSegmentos && !aborted; i++) {
             Segmento seg = curvaActual.segmentos[i];
             Serial.printf("[Curva] Segmento %d / %d: T=%.1f, R=%.1f, M=%d\n",
                           i + 1, curvaActual.numSegmentos,
                           seg.tempObjetivo, seg.rampaCporMin, seg.tiempoRemojoMin);
+            runCurrentSegment = i;
+
+            // Si el resume nos dejó en REMOJO de este segmento, saltamos la
+            // rampa (la temperatura objetivo ya estaba alcanzada antes).
+            bool skipRamp = (i == startSegmentIdx && startPhase == "REMOJO");
 
             // --- Rampa ---
-            float tempLocal = 0.0f;
-            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                tempLocal = temperaturaActual;
-                xSemaphoreGive(xMutex);
-            }
+            if (!skipRamp) {
+                runCurrentPhase = "RAMPA";
 
-            float rampaPorSegundo = seg.rampaCporMin / 60.0;
-            while (tempLocal < seg.tempObjetivo) {
-                String estadoLocal;
+                float tempLocal = 0.0f;
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    estadoLocal = estadoHorno;
+                    tempLocal = temperaturaActual;
                     xSemaphoreGive(xMutex);
                 }
 
-                if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
-                    aborted = true;
-                    break;
-                }
-                if (estadoLocal == "PAUSADO") {
-                    // Pausa: esperar sin avanzar la rampa.
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    continue;
-                }
-                if (estadoLocal != "CALENTANDO") {
-                    // Estado transitorio: esperar y reevaluar.
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    continue;
+                // Persistir entrada a la rampa de este segmento.
+                {
+                    String estadoCopy;
+                    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        estadoCopy = estadoHorno;
+                        xSemaphoreGive(xMutex);
+                    }
+                    saveRunState(estadoCopy, i, "RAMPA", 0UL, tempLocal);
                 }
 
-                tempLocal += rampaPorSegundo;  // Simulación
-                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    temperaturaActual = tempLocal;
-                    xSemaphoreGive(xMutex);
+                float rampaPorSegundo = seg.rampaCporMin / 60.0;
+                while (tempLocal < seg.tempObjetivo) {
+                    String estadoLocal;
+                    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        estadoLocal = estadoHorno;
+                        xSemaphoreGive(xMutex);
+                    }
+
+                    if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
+                        aborted = true;
+                        break;
+                    }
+                    if (estadoLocal == "PAUSADO") {
+                        // Pausa: esperar sin avanzar la rampa.
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        continue;
+                    }
+                    if (estadoLocal != "CALENTANDO") {
+                        // Estado transitorio: esperar y reevaluar.
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        continue;
+                    }
+
+                    tempLocal += rampaPorSegundo;  // Simulación
+                    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        temperaturaActual = tempLocal;
+                        xSemaphoreGive(xMutex);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                 }
-                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (aborted) break;
+            } else {
+                Serial.printf("[Curva] Saltando rampa del segmento %d (resume en REMOJO)\n", i + 1);
             }
-            if (aborted) break;
 
             // --- Remojo ---
-            // Tiempo acumulado solo cuando está en CALENTANDO. Así una pausa
-            // larga no se descuenta del remojo y al reanudar termina con la
-            // duración correcta.
-            unsigned long tiempoAcumuladoMs = 0;
+            runCurrentPhase = "REMOJO";
+
+            // En un resume del propio segmento, partimos del soak ya
+            // acumulado antes del corte; en cualquier otro caso empezamos
+            // desde cero para este segmento.
+            unsigned long tiempoAcumuladoMs =
+                (i == startSegmentIdx && startPhase == "REMOJO") ? startSoakMs : 0UL;
             unsigned long objetivoMs = (unsigned long)seg.tiempoRemojoMin * 60000UL;
+
+            // Persistir entrada a la fase de remojo.
+            {
+                String estadoCopy;
+                float tempCopy = 0.0f;
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    estadoCopy = estadoHorno;
+                    tempCopy = temperaturaActual;
+                    xSemaphoreGive(xMutex);
+                }
+                runSoakAccumMs = tiempoAcumuladoMs;
+                saveRunState(estadoCopy, i, "REMOJO", tiempoAcumuladoMs, tempCopy);
+            }
+
+            // Cada cuánto persistimos el progreso de remojo en NVS. Cada
+            // 30 s es un buen balance: pierde como mucho 30 s en un corte
+            // de luz y no desgasta el flash.
+            const unsigned long PERSIST_EVERY_MS = 30000UL;
+            unsigned long lastPersistMs = tiempoAcumuladoMs;
+
             while (tiempoAcumuladoMs < objetivoMs) {
                 String estadoLocal;
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -2013,8 +2222,26 @@ void TaskControlCurva(void* pvParameters) {
                 }
 
                 tiempoAcumuladoMs += 1000;
+                runSoakAccumMs = tiempoAcumuladoMs;
                 vTaskDelay(pdMS_TO_TICKS(1000));
+
+                if (tiempoAcumuladoMs - lastPersistMs >= PERSIST_EVERY_MS) {
+                    String estadoCopy;
+                    float tempCopy = 0.0f;
+                    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        estadoCopy = estadoHorno;
+                        tempCopy = temperaturaActual;
+                        xSemaphoreGive(xMutex);
+                    }
+                    saveRunState(estadoCopy, i, "REMOJO", tiempoAcumuladoMs, tempCopy);
+                    lastPersistMs = tiempoAcumuladoMs;
+                }
             }
+
+            // El primer segmento ya consumió su startPhase/startSoakMs;
+            // los siguientes deben empezar limpios.
+            startPhase = "RAMPA";
+            startSoakMs = 0;
         }
 
         // --- Cierre del programa ---
@@ -2031,6 +2258,10 @@ void TaskControlCurva(void* pvParameters) {
             programPauseTime = 0;  // Resetear timestamp de pausa
             xSemaphoreGive(xMutex);
         }
+
+        // Programa terminado / abortado: limpiamos run_state para que un
+        // reinicio no dispare INTERRUMPIDO de algo que ya no está corriendo.
+        clearRunState();
     }
 }
 
@@ -2256,6 +2487,24 @@ void setup() {
     // NUEVO: Cargar programa activo guardado
     loadProfile();
     Serial.println("[SETUP] ✅ Programa activo cargado");
+    delay(50);
+
+    // Si la cocción anterior estaba en CALENTANDO o PAUSADO al cortarse la
+    // luz, loadRunState() pondrá estadoHorno = "INTERRUMPIDO" y dejará las
+    // variables runCurrentSegment / runCurrentPhase / runSoakAccumMs listas
+    // para que TaskControlCurva pueda reanudar cuando llegue RESUME.
+    loadRunState();
+    // Sin cocción interrumpida pendiente: arranque explícito en inactivo para
+    // que HTTP/Firebase no hereden un estado viejo de la sesión anterior.
+    if (estadoHorno != "INTERRUMPIDO") {
+        estadoHorno = "IDLE";
+        programStartTime = 0;
+        programPauseTime = 0;
+        Serial.println("[SETUP] Horno en IDLE (inactivo)");
+    }
+    // Al reconectar Firebase, publicar el estado real de inmediato para no dejar
+    // CALENTANDO/INTERRUMPIDO viejos en RTDB mientras el horno ya está IDLE.
+    needsBootRealtimePublish = true;
     delay(50);
 
     // MAX31855 (termocupla): mismo pinout que proyecto MAX31855, conector P2

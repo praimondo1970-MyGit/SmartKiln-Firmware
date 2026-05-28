@@ -5,6 +5,19 @@
 
 extern void kiln_notifyLocalSessionComplete();
 
+// Helpers de persistencia del estado de ejecución (run_state). Definidos
+// en main.cpp; los declaramos aquí para poder grabar / borrar el estado
+// cuando llegan los comandos START / PAUSE / STOP / RESUME.
+extern void saveRunState(const String& estado,
+                         int segmentIdx,
+                         const String& phase,
+                         unsigned long soakAccumMs,
+                         float tempSnapshot);
+extern void clearRunState();
+extern volatile int runCurrentSegment;
+extern String runCurrentPhase;
+extern volatile unsigned long runSoakAccumMs;
+
 String kiln_buildStatusJson() {
     StaticJsonDocument<512> doc;
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -98,16 +111,45 @@ String kiln_processCommand(const String& cmdRaw) {
             programStartTime = millis();
             programTotalDurationMinutes = totalDuration;
         }
+        // Persistimos un run_state inicial; TaskControlCurva luego va
+        // refinándolo a medida que avanza por segmentos/fases.
+        saveRunState("CALENTANDO",
+                     runCurrentSegment >= 0 ? (int)runCurrentSegment : 0,
+                     runCurrentPhase.length() > 0 ? runCurrentPhase : String("RAMPA"),
+                     runSoakAccumMs,
+                     temperaturaActual);
         Serial.println("[API] START");
     } else if (cmd == "PAUSE") {
         estadoHorno = "PAUSADO";
         programPauseTime = millis();
+        // Importante: en PAUSADO también queremos que un corte de luz
+        // detecte interrupción. Reescribimos run_state con el estado nuevo
+        // pero conservando segIdx / phase / soakMs.
+        saveRunState("PAUSADO",
+                     runCurrentSegment >= 0 ? (int)runCurrentSegment : 0,
+                     runCurrentPhase.length() > 0 ? runCurrentPhase : String("RAMPA"),
+                     runSoakAccumMs,
+                     temperaturaActual);
         Serial.println("[API] PAUSE");
+    } else if (cmd == "RESUME") {
+        // RESUME se usa para retomar después de INTERRUMPIDO. La diferencia
+        // con START es que TaskControlCurva tiene que arrancar desde el
+        // segmento/fase guardados, no desde cero. resumeFromSavedState ya
+        // está en true porque loadRunState() lo dejó así al boot; acá solo
+        // cambiamos el estado a CALENTANDO y la tarea hace el resto.
+        estadoHorno = "CALENTANDO";
+        programPauseTime = 0;
+        // No persistimos un run_state nuevo: TaskControlCurva va a hacerlo
+        // apenas entre al ciclo y reescriba con la temp/segmento correctos.
+        Serial.println("[API] RESUME");
     } else if (cmd == "STOP") {
-        estadoHorno = "DETENIDO";
+        estadoHorno = "IDLE";
         programStartTime = 0;
         programPauseTime = 0;
-        Serial.println("[API] STOP");
+        // STOP cancela definitivamente: borramos el run_state para que un
+        // reinicio futuro no levante INTERRUMPIDO.
+        clearRunState();
+        Serial.println("[API] STOP → IDLE");
     } else if (cmd == "TEST") {
         resp["ok"] = true;
         resp["message"] = "TEST_OK";
@@ -132,7 +174,7 @@ String kiln_processCommand(const String& cmdRaw) {
     resp["ok"] = true;
     resp["cmd"] = cmd;
     resp["status"] = estadoHorno;
-    if (cmd == "START" || cmd == "PAUSE" || cmd == "STOP") {
+    if (cmd == "START" || cmd == "PAUSE" || cmd == "STOP" || cmd == "RESUME") {
         kiln_onLocalSessionEnd(cmd.c_str());
     }
     String out;
