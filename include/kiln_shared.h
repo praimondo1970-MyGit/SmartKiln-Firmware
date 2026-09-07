@@ -40,3 +40,9 @@ extern bool wifiConfigReceived;
 int calculateProgramTotalDuration(float initialTemp);
 void saveProfile();
 void saveKilnInfo();
+
+/** Timestamp (ms) del programa en la app; se publica en RTDB profileState. */
+extern unsigned long profileUpdatedAtMs;
+extern volatile bool needsProfileStatePublish;
+
+void kiln_scheduleProfileStatePublish();

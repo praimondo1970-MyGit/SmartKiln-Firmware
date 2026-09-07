@@ -17,3 +17,6 @@ String kiln_buildApInfoJson();
 
 /** Tras HTTP local (perfil, START, kiln-info): libera AP y marca sync Firebase. */
 void kiln_onLocalSessionEnd(const char* reason);
+
+/** Guarda programUpdatedAt (ms desde la app) y programa publicación en profileState. */
+void kiln_onProfileLoaded(unsigned long programUpdatedAtFromApp);
