@@ -41,10 +41,12 @@ GROOVE_D       =  1.3;   // profundidad del riel
 GROOVE_Z_CLEAR =  0.35;  // holgura vertical de la tapa
 LID_XY_CLEAR   =  0.40;
 
-TC_SLOT_W      =  6.0;
-TC_SLOT_H      =  5.0;
-SPI_SLOT_W     = 14.0;
-SPI_SLOT_H     =  6.0;
+// v1: orificios pequeños (el Dupont queda adentro)
+TC_HOLE_D      =  3.2;
+TC_HOLE_N      =  2;
+TC_HOLE_PITCH  =  5.5;
+SPI_HOLE_D     =  5.5;
+HOLE_Z         =  FLOOR + 6.8;
 
 VENT_N         =  6;
 VENT_L         = 18.0;
@@ -92,7 +94,7 @@ module base() {
 
         // cavidad
         translate([WALL, WALL, FLOOR])
-            cube([OUTER_L - WALL + 0.2, INNER_W, INNER_H + 1]);
+            cube([OUTER_L - 2 * WALL, INNER_W, INNER_H + 1]);
 
         // rieles: ranura en las dos paredes largas
         translate([WALL - GROOVE_D, WALL - GROOVE_D, LID_Z])
@@ -106,17 +108,18 @@ module base() {
             rotate([-45, 0, 0])
                 cube([OUTER_L, 2.2, 2.2]);
 
-        // U termocupla (pared cerrada)
-        translate([WALL / 2, OUTER_W / 2, FLOOR + INNER_H - TC_SLOT_H])
-            rotate([0, 0, 90])
-                u_slot(TC_SLOT_W, TC_SLOT_H + 1, WALL + 3);
+        // orificios v1 (pequeños)
+        for (i = [0 : TC_HOLE_N - 1])
+            translate([-0.4, OUTER_W / 2 - (TC_HOLE_N - 1) * TC_HOLE_PITCH / 2 + i * TC_HOLE_PITCH, HOLE_Z])
+                rotate([0, 90, 0])
+                    cylinder(h = WALL + 1.0, d = TC_HOLE_D);
+        translate([OUTER_L - WALL - 0.4, OUTER_W / 2, HOLE_Z])
+            rotate([0, 90, 0])
+                cylinder(h = WALL + 1.2, d = SPI_HOLE_D);
 
-        translate([0, OUTER_W / 2 - TC_SLOT_W / 2, FLOOR + INNER_H - TC_SLOT_H])
-            cube([WALL + 0.4, TC_SLOT_W, TC_SLOT_H + 2]);
-
-        // U SPI (extremo abierto, tapa sale por acá)
-        translate([OUTER_L - 2.5, OUTER_W / 2 - SPI_SLOT_W / 2, FLOOR + INNER_H - SPI_SLOT_H])
-            cube([4, SPI_SLOT_W, SPI_SLOT_H + 2]);
+        // buzón de la tapa en la pared SPI
+        translate([OUTER_L - WALL - 0.2, (OUTER_W - (INNER_W + 2 * GROOVE_D - LID_XY_CLEAR)) / 2 - 0.15, LID_Z])
+            cube([WALL + 0.6, INNER_W + 2 * GROOVE_D - LID_XY_CLEAR + 0.3, GROOVE_H + 0.15]);
     }
 
     // piso de la ranura (estante) — se imprime sólido
