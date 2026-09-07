@@ -17,6 +17,7 @@ extern void clearRunState();
 extern volatile int runCurrentSegment;
 extern String runCurrentPhase;
 extern volatile unsigned long runSoakAccumMs;
+extern volatile bool resumeFromSavedState;
 
 String kiln_buildStatusJson() {
     StaticJsonDocument<512> doc;
@@ -42,7 +43,17 @@ String kiln_buildStatusJson() {
         }
         doc["elapsedMinutes"] = elapsedMin;
         doc["remainingMinutes"] = remainingMin;
-        doc["currentStage"] = curvaActual.recibida && curvaActual.numSegmentos > 0 ? 1 : 0;
+        int stageForApi = 0;
+        if (curvaActual.recibida && curvaActual.numSegmentos > 0) {
+            const bool activeRun = (estadoHorno == "CALENTANDO" ||
+                                    estadoHorno == "PAUSADO" ||
+                                    estadoHorno == "INTERRUMPIDO");
+            if (activeRun && runCurrentSegment >= 0 &&
+                runCurrentSegment < curvaActual.numSegmentos) {
+                stageForApi = runCurrentSegment + 1;
+            }
+        }
+        doc["currentStage"] = stageForApi;
         xSemaphoreGive(xMutex);
     } else {
         doc["error"] = "mutex_timeout";
@@ -101,6 +112,11 @@ String kiln_processCommand(const String& cmdRaw) {
 
     if (cmd == "START") {
         estadoHorno = "CALENTANDO";
+        // START nuevo: siempre segmento 0 (RESUME retoma run_state guardado).
+        runCurrentSegment = 0;
+        runCurrentPhase = "RAMPA";
+        runSoakAccumMs = 0;
+        resumeFromSavedState = false;
         if (programPauseTime > 0) {
             unsigned long pauseDuration = millis() - programPauseTime;
             programStartTime += pauseDuration;
@@ -111,13 +127,7 @@ String kiln_processCommand(const String& cmdRaw) {
             programStartTime = millis();
             programTotalDurationMinutes = totalDuration;
         }
-        // Persistimos un run_state inicial; TaskControlCurva luego va
-        // refinándolo a medida que avanza por segmentos/fases.
-        saveRunState("CALENTANDO",
-                     runCurrentSegment >= 0 ? (int)runCurrentSegment : 0,
-                     runCurrentPhase.length() > 0 ? runCurrentPhase : String("RAMPA"),
-                     runSoakAccumMs,
-                     temperaturaActual);
+        saveRunState("CALENTANDO", 0, "RAMPA", 0UL, temperaturaActual);
         Serial.println("[API] START");
     } else if (cmd == "PAUSE") {
         estadoHorno = "PAUSADO";
@@ -208,6 +218,9 @@ bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
     }
     curvaActual.recibida = true;
 
+    const unsigned long updatedAtFromApp = doc["programUpdatedAt"] | 0UL;
+    kiln_onProfileLoaded(updatedAtFromApp);
+
     float currentTempForDuration = 25.0f;
     if (temperaturaActual > 0) {
         currentTempForDuration = temperaturaActual;
@@ -216,7 +229,10 @@ bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
     xSemaphoreGive(xMutex);
 
     saveProfile();
-    Serial.printf("[API] Perfil cargado: %s (%d seg)\n", curvaActual.nombre, curvaActual.numSegmentos);
+    Serial.printf("[API] Perfil cargado: %s (%d seg) estado=%s\n",
+                  curvaActual.nombre, curvaActual.numSegmentos, estadoHorno.c_str());
+    // Si hay cocción en curso, el perfil se aplica en caliente (TaskControlCurva
+    // relee objetivos/remojo). Igual liberamos la sesión AP del móvil.
     kiln_onLocalSessionEnd("profile");
     return true;
 }

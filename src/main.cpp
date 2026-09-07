@@ -72,6 +72,8 @@ void saveProfile();
 void loadProfile();
 void logStoredData();
 void reconnectToWifi();
+void kiln_onProfileLoaded(unsigned long programUpdatedAtFromApp);
+bool publishProfileStateToFirebase();
 String getMacAddress();
 bool initFirebase();
 void scheduleFirebaseInit(const char* reason);
@@ -124,6 +126,8 @@ String estadoHorno = "IDLE";
 bool wifiConnected = false;
 bool firebaseConnected = false;
 bool needsDeviceInfoUpdate = false;  // Flag para actualizar deviceInfo desde tarea
+unsigned long profileUpdatedAtMs = 0;
+volatile bool needsProfileStatePublish = false;
 bool needsBootRealtimePublish = false;  // Publicar estado real al conectar Firebase tras boot
 unsigned int firebaseErrorCount = 0;  // Contador de errores consecutivos
 
@@ -434,6 +438,8 @@ void saveProfile() {
     
     // Guardar flag de recibida
     bool receivedSaved = preferences.putBool("recibida", curvaActual.recibida);
+
+    preferences.putULong("programUpdatedAt", profileUpdatedAtMs);
     
     preferences.end();
     
@@ -528,6 +534,7 @@ void loadProfile() {
     
     // Cargar flag de recibida
     curvaActual.recibida = preferences.getBool("recibida", false);
+    profileUpdatedAtMs = preferences.getULong("programUpdatedAt", 0UL);
     
     preferences.end();
     
@@ -560,6 +567,7 @@ void loadProfile() {
         }
         programTotalDurationMinutes = calculateProgramTotalDuration(initialTemp);
         Serial.printf("[STORAGE] ⏱️ Duración total del programa calculada: %d minutos\n", programTotalDurationMinutes);
+        kiln_scheduleProfileStatePublish();
     } else {
         Serial.println("[STORAGE] ❌ Segmentos inválidos, limpiando perfil");
         memset(&curvaActual, 0, sizeof(CurvaActiva));
@@ -643,11 +651,14 @@ void loadRunState() {
     runCurrentSegment = segIdx;
     runCurrentPhase = phase;
     runSoakAccumMs = soakMs;
-    if (tempPrev > 0.0f && tempPrev < 1500.0f) {
-        temperaturaActual = tempPrev;
-    }
+    // No restaurar temperaturaActual desde NVS: la termocupla es la fuente
+    // de verdad (evita mostrar un valor simulado obsoleto tras un corte).
     resumeFromSavedState = true;
     estadoHorno = "INTERRUMPIDO";
+    // Persistir INTERRUMPIDO (antes NVS seguía en CALENTANDO y confunde debug/UI).
+    saveRunState("INTERRUMPIDO", segIdx, phase, soakMs, tempPrev);
+    // Forzar publicación a Firebase apenas STA conecte (sobrescribe CALENTANDO viejo).
+    needsBootRealtimePublish = true;
     Serial.printf("[RunState] *** Cocción interrumpida detectada (seg %d, %s) → estadoHorno=INTERRUMPIDO\n",
                   segIdx + 1, phase.c_str());
 }
@@ -793,7 +804,9 @@ void connectWiFi() {
     }
 }
 
-static TaskHandle_t s_firebaseInitTaskHandle = nullptr;
+static volatile bool s_firebaseInitPending = false;
+static volatile bool s_firebaseInitBusy = false;
+static const char* s_firebaseInitReason = nullptr;
 static volatile bool pendingFirebaseReport = false;
 static bool s_firebaseBootstrapBusy = false;
 static unsigned long s_lastFirebaseBootstrapMs = 0;
@@ -856,7 +869,7 @@ static void runPendingFirebaseReport() {
     if (!pendingFirebaseReport) {
         return;
     }
-    if (s_firebaseInitTaskHandle != nullptr) {
+    if (s_firebaseInitPending || s_firebaseInitBusy) {
         return;
     }
     if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp() || wifi_manager_apStationCount() > 0) {
@@ -882,18 +895,35 @@ static void runPendingFirebaseReport() {
     reportToFirebase(tempCopy, estadoCopy);
 }
 
-static void firebaseInitTask(void* /*pv*/) {
-    while (!wifi_manager_isFirebaseSafe()) {
-        vTaskDelay(pdMS_TO_TICKS(250));
+static void runPendingFirebaseInit() {
+    if (!s_firebaseInitPending || s_firebaseInitBusy || firebaseConnected) {
+        return;
     }
-    Serial.printf("[Firebase] Tarea init, heap: %u\n", (unsigned)ESP.getFreeHeap());
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp()) {
+        return;
+    }
+    s_firebaseInitPending = false;
+    s_firebaseInitBusy = true;
+    Serial.printf("[Firebase] Init en TaskCom (%s), heap: %u\n",
+                  s_firebaseInitReason ? s_firebaseInitReason : "?",
+                  (unsigned)ESP.getFreeHeap());
+
+    // SoftAP activo rompe DNS UDP en muchos ESP32: pausar AP sin clientes.
+    const bool pausedAp = wifi_manager_pauseApForInternet();
+    delay(300);
+    wifi_manager_ensurePublicDns();
+
     const bool ok = initFirebase();
-    s_firebaseInitTaskHandle = nullptr;
+
+    if (pausedAp || wifi_manager_isApPausedForInternet()) {
+        wifi_manager_resumeApAfterInternet();
+    }
+
+    s_firebaseInitBusy = false;
     if (ok) {
         wifiConnected = true;
         requestFirebaseBootstrap();
     }
-    vTaskDelete(nullptr);
 }
 
 void kiln_notifyLocalSessionComplete() {
@@ -939,25 +969,16 @@ void processImmediateFirebaseSync() {
 }
 
 void scheduleFirebaseInit(const char* reason) {
-    if (firebaseConnected || s_firebaseInitTaskHandle != nullptr) {
+    if (firebaseConnected || s_firebaseInitPending || s_firebaseInitBusy) {
         return;
     }
     if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp()) {
         return;
     }
+    s_firebaseInitReason = reason;
+    s_firebaseInitPending = true;
     Serial.printf("[Firebase] Programando init (%s), heap libre: %u\n",
                   reason ? reason : "?", (unsigned)ESP.getFreeHeap());
-    if (xTaskCreatePinnedToCore(
-            firebaseInitTask,
-            "FirebaseInit",
-            20480,
-            nullptr,
-            2,
-            &s_firebaseInitTaskHandle,
-            0) != pdPASS) {
-        s_firebaseInitTaskHandle = nullptr;
-        Serial.println("[Firebase] ❌ No se pudo crear tarea FirebaseInit");
-    }
 }
 
 bool initFirebase() {
@@ -965,25 +986,64 @@ bool initFirebase() {
     Serial.println("[Firebase] Iniciando conexión a Firebase...");
     Serial.printf("[Firebase] Database URL: %s\n", FIREBASE_DATABASE_URL);
     Serial.printf("[Firebase] WiFi status: %d\n", WiFi.status());
-    Serial.printf("[Firebase] Heap libre: %u (min: %u)\n",
-                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
-    
+    Serial.printf("[Firebase] IP: %s DNS: %s\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str());
+    Serial.printf("[Firebase] Heap libre: %u (min: %u maxAlloc: %u)\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMinFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
+
     if (config == nullptr || auth == nullptr || fbdo == nullptr) {
         Serial.println("[Firebase] ❌ ERROR: Objetos Firebase no inicializados");
         return false;
     }
-    
+
+    wifi_manager_ensurePublicDns();
+
+    // Probar DNS antes del TLS (signUp llama a identitytoolkit.googleapis.com).
+    {
+        IPAddress resolved;
+        bool dnsOk = WiFi.hostByName("identitytoolkit.googleapis.com", resolved);
+        if (!dnsOk) {
+            Serial.println("[Firebase] DNS falló con SoftAP/estado actual — forzando STA-only");
+            wifi_manager_pauseApForInternet();
+            delay(400);
+            wifi_manager_ensurePublicDns();
+            dnsOk = WiFi.hostByName("identitytoolkit.googleapis.com", resolved);
+        }
+        if (!dnsOk) {
+            // Diagnóstico: ¿resuelve algo más?
+            IPAddress googleDns;
+            const bool gOk = WiFi.hostByName("dns.google", googleDns);
+            Serial.printf("[Firebase] ❌ DNS identitytoolkit falló (dns.google=%s)\n",
+                          gOk ? googleDns.toString().c_str() : "FAIL");
+            firebaseConnected = false;
+            return false;
+        }
+        Serial.printf("[Firebase] DNS OK identitytoolkit → %s\n", resolved.toString().c_str());
+    }
+
     config->api_key = FIREBASE_API_KEY;
     config->database_url = FIREBASE_DATABASE_URL;
-    config->timeout.serverResponse = 3000;  // Timeout de 3 segundos
-    config->timeout.socketConnection = 3000;
-    config->timeout.rtdbKeepAlive = 30000;  // Keep alive cada 30s
-    config->timeout.rtdbStreamReconnect = 1000;  // Reconectar rápido
-    
-    fbdo->setResponseSize(512);
-    fbdo->setBSSLBufferSize(512, 512);
+    // 3 s era demasiado corto para DNS+TLS en AP+STA.
+    config->timeout.serverResponse = 15000;
+    config->timeout.socketConnection = 15000;
+    config->timeout.rtdbKeepAlive = 30000;
+    config->timeout.rtdbStreamReconnect = 1000;
 
-    Serial.println("[Firebase] Intentando signUp...");
+    fbdo->setResponseSize(1024);
+    // 512/512 provoca "Failed to initialize the SSL layer" con poco heap.
+    const uint32_t heapNow = ESP.getFreeHeap();
+    if (heapNow >= 70000 && ESP.getMaxAllocHeap() >= 12000) {
+        fbdo->setBSSLBufferSize(2048, 1024);
+    } else if (heapNow >= 50000) {
+        fbdo->setBSSLBufferSize(1024, 512);
+    } else {
+        fbdo->setBSSLBufferSize(768, 512);
+    }
+
+    Serial.println("[Firebase] Intentando signUp anónimo...");
     if (Firebase.signUp(config, auth, "", "")) {
         Serial.println("[Firebase] signUp exitoso, iniciando Firebase.begin...");
         Firebase.begin(config, auth);
@@ -994,15 +1054,19 @@ bool initFirebase() {
         Serial.println("[Firebase] ✅ CONECTADO CORRECTAMENTE");
         Serial.println("[Firebase] =========================================");
         return true;
-    } else {
-        firebaseConnected = false;
-        Serial.println("[Firebase] =========================================");
-        Serial.println("[Firebase] ❌ ERROR EN CONEXIÓN");
-        Serial.printf("[Firebase] Error: %s\n", fbdo->errorReason().c_str());
-        Serial.printf("[Firebase] Error code: %d\n", fbdo->errorCode());
-        Serial.println("[Firebase] =========================================");
-        return false;
     }
+
+    firebaseConnected = false;
+    Serial.println("[Firebase] =========================================");
+    Serial.println("[Firebase] ❌ ERROR EN CONEXIÓN");
+    Serial.printf("[Firebase] Error: %s\n", fbdo->errorReason().c_str());
+    Serial.printf("[Firebase] Error code: %d\n", fbdo->errorCode());
+    if (config->signer.signupError.message.length() > 0) {
+        Serial.printf("[Firebase] signupError: %s\n",
+                      config->signer.signupError.message.c_str());
+    }
+    Serial.println("[Firebase] =========================================");
+    return false;
 }
 
 static bool firebaseRtdbOkAfterWrite() {
@@ -1021,6 +1085,92 @@ static bool firebaseRtdbOkAfterWrite() {
         Serial.printf("[Firebase] ❌ RTDB: %s\n", err.c_str());
         return false;
     }
+    return true;
+}
+
+void kiln_scheduleProfileStatePublish() {
+    needsProfileStatePublish = true;
+}
+
+void kiln_onProfileLoaded(unsigned long programUpdatedAtFromApp) {
+    profileUpdatedAtMs = programUpdatedAtFromApp;
+    if (profileUpdatedAtMs == 0UL) {
+        profileUpdatedAtMs = millis();
+    }
+    kiln_scheduleProfileStatePublish();
+}
+
+bool publishProfileStateToFirebase() {
+    if (!wifi_manager_isFirebaseSafe() || !kiln_staLinkUp()) {
+        return false;
+    }
+    if (s_firebaseConnectMs > 0 &&
+        millis() - s_firebaseConnectMs < FIREBASE_POST_CONNECT_DELAY_MS) {
+        return false;
+    }
+    if (!wifiConnected || !firebaseConnected || !Firebase.ready()) {
+        return false;
+    }
+    if (fbdo == nullptr) {
+        return false;
+    }
+
+    String localUserId;
+    String localDeviceMacAddress;
+    String localProgramName;
+    bool profileLoaded = false;
+    unsigned long localUpdatedAt = 0;
+
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    localUserId = userId;
+    localDeviceMacAddress = deviceMacAddress;
+    profileLoaded = curvaActual.recibida;
+    if (profileLoaded && strlen(curvaActual.nombre) > 0) {
+        localProgramName = String(curvaActual.nombre);
+    }
+    localUpdatedAt = profileUpdatedAtMs;
+    xSemaphoreGive(xMutex);
+
+    if (localUserId == "" || localDeviceMacAddress == "") {
+        return false;
+    }
+
+    fbdo->setResponseSize(256);
+    Firebase.RTDB.setwriteSizeLimit(fbdo, "tiny");
+    fbdo->setBSSLBufferSize(512, 512);
+
+    const String basePath = "/users/" + localUserId + "/kilns/" + localDeviceMacAddress + "/profileState";
+    if (!profileLoaded) {
+        Firebase.RTDB.setString(fbdo, (basePath + "/programName").c_str(), "");
+        if (!firebaseRtdbOkAfterWrite()) {
+            return false;
+        }
+        Firebase.RTDB.setDouble(fbdo, (basePath + "/programUpdatedAt").c_str(), 0.0);
+        if (!firebaseRtdbOkAfterWrite()) {
+            return false;
+        }
+    } else {
+        Firebase.RTDB.setString(fbdo, (basePath + "/programName").c_str(), localProgramName);
+        if (!firebaseRtdbOkAfterWrite()) {
+            return false;
+        }
+        Firebase.RTDB.setDouble(fbdo, (basePath + "/programUpdatedAt").c_str(), (double)localUpdatedAt);
+        if (!firebaseRtdbOkAfterWrite()) {
+            return false;
+        }
+    }
+
+    if (!Firebase.RTDB.setTimestamp(fbdo, (basePath + "/loadedAt").c_str())) {
+        return false;
+    }
+    if (!firebaseRtdbOkAfterWrite()) {
+        return false;
+    }
+
+    Serial.printf("[Firebase] profileState publicado: '%s' updatedAt=%lu\n",
+                  localProgramName.c_str(), localUpdatedAt);
     return true;
 }
 
@@ -1098,9 +1248,21 @@ void reportToFirebase(float temp, const String& estado) {
     
     const bool activeRun = (estado == "CALENTANDO" || estado == "PAUSADO");
     if (!activeRun) {
-        // IDLE / INTERRUMPIDO / DETENIDO / FINALIZADO: limpiar nombre en RTDB
-        // para que la app no infiera "Horneando" por programName obsoleto.
+        // IDLE / INTERRUMPIDO / DETENIDO / FINALIZADO: limpiar nombre y tiempos
+        // en RTDB para que la app no infiera "Horneando" por datos obsoletos.
         Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), "");
+        if (!firebaseRtdbOkAfterWrite()) {
+            return;
+        }
+        Firebase.RTDB.setInt(fbdo, (realtimePath + "/programStartTime").c_str(), 0);
+        if (!firebaseRtdbOkAfterWrite()) {
+            return;
+        }
+        Firebase.RTDB.setInt(fbdo, (realtimePath + "/programTotalDuration").c_str(), 0);
+        if (!firebaseRtdbOkAfterWrite()) {
+            return;
+        }
+        Firebase.RTDB.setInt(fbdo, (realtimePath + "/programPauseTime").c_str(), 0);
         if (!firebaseRtdbOkAfterWrite()) {
             return;
         }
@@ -1216,12 +1378,18 @@ bool updateDeviceInfoFirebase() {
     // Usar método directo para cada campo (menos stack)
     Firebase.RTDB.setFloat(fbdo, (realtimePath + "/temperature").c_str(), localTemp);
     Firebase.RTDB.setString(fbdo, (realtimePath + "/status").c_str(), localEstado);
-    
-    // Actualizar nombre del programa si existe
-    if (localProgramName != "") {
-        Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), localProgramName);
+
+    // Solo publicar nombre de programa si la cocción está activa (no INTERRUMPIDO/IDLE).
+    if (localEstado == "CALENTANDO" || localEstado == "PAUSADO") {
+        if (localProgramName != "") {
+            Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), localProgramName);
+        }
+    } else {
+        Firebase.RTDB.setString(fbdo, (realtimePath + "/programName").c_str(), "");
+        Firebase.RTDB.setInt(fbdo, (realtimePath + "/programStartTime").c_str(), 0);
+        Firebase.RTDB.setInt(fbdo, (realtimePath + "/programTotalDuration").c_str(), 0);
     }
-    
+
     // Usar Firebase Server Timestamp
     bool success2 = Firebase.RTDB.setTimestamp(fbdo, (realtimePath + "/timestamp").c_str());
     
@@ -1241,6 +1409,7 @@ void onStaGainedConnection() {
     if (WiFi.status() != WL_CONNECTED) {
         return;
     }
+    wifi_manager_ensurePublicDns();
     if (wifi_manager_apStationCount() > 0) {
         Serial.println("[Firebase] STA lista pero hay movil en AP — telemetria diferida");
         return;
@@ -1550,6 +1719,7 @@ class CurvaCallback : public NimBLECharacteristicCallbacks {
             }
 
             // Guardar programa en memoria persistente
+            kiln_onProfileLoaded(doc["programUpdatedAt"] | 0UL);
             saveProfile();
             
             Serial.printf("[BLE] ⏱️ Duración total del programa calculada: %d minutos\n", programTotalDurationMinutes);
@@ -1806,6 +1976,7 @@ void TaskComunicaciones(void* pvParameters) {
         wifi_manager_tick();
         wifi_manager_prioritizeApClients();
         processImmediateFirebaseSync();
+        runPendingFirebaseInit();
         runPendingFirebaseReport();
         lastFirebaseUpdate = millis();
 
@@ -1946,6 +2117,12 @@ void TaskComunicaciones(void* pvParameters) {
             }
         }
 
+        if (needsProfileStatePublish && wifiConnected && firebaseConnected && !wifiSuspended) {
+            if (publishProfileStateToFirebase()) {
+                needsProfileStatePublish = false;
+            }
+        }
+
         // --- Guardado diferido desde callbacks BLE (evita stack overflow en tarea NimBLE) ---
         if (pendingKilnInfoSave) {
             pendingKilnInfoSave = false;
@@ -1989,7 +2166,7 @@ void TaskComunicaciones(void* pvParameters) {
             wifiConnected = false;
         }
         if (staReady && !wifiSuspended && !apHasPhone && wifi_manager_isFirebaseSafe() &&
-            s_firebaseInitTaskHandle == nullptr &&
+            !s_firebaseInitPending && !s_firebaseInitBusy &&
             (s_firebaseConnectMs == 0 ||
              millis() - s_firebaseConnectMs >= FIREBASE_POST_CONNECT_DELAY_MS)) {
             wifiConnected = true;
@@ -2121,9 +2298,9 @@ void TaskControlCurva(void* pvParameters) {
             if (!skipRamp) {
                 runCurrentPhase = "RAMPA";
 
-                float tempLocal = 0.0f;
+                float tempAtRampStart = 0.0f;
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    tempLocal = temperaturaActual;
+                    tempAtRampStart = temperaturaActual;
                     xSemaphoreGive(xMutex);
                 }
 
@@ -2134,15 +2311,29 @@ void TaskControlCurva(void* pvParameters) {
                         estadoCopy = estadoHorno;
                         xSemaphoreGive(xMutex);
                     }
-                    saveRunState(estadoCopy, i, "RAMPA", 0UL, tempLocal);
+                    saveRunState(estadoCopy, i, "RAMPA", 0UL, tempAtRampStart);
                 }
 
-                float rampaPorSegundo = seg.rampaCporMin / 60.0;
-                while (tempLocal < seg.tempObjetivo) {
+                // Esperar a que la termocupla alcance la temperatura objetivo.
+                // IMPORTANTE: no escribir en temperaturaActual aquí — la actualiza
+                // TaskControlHorno desde el MAX31855. Antes se simulaba la rampa
+                // en temperaturaActual y la UI/Firebase oscilaban entre real y objetivo.
+                // Releemos tempObjetivo desde curvaActual en cada ciclo para que un
+                // POST /api/profile en caliente (edición desde la app) aplique al tramo actual.
+                const float reachTolerance = 2.0f;
+
+                while (true) {
                     String estadoLocal;
+                    float targetTemp = 0.0f;
                     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         estadoLocal = estadoHorno;
+                        if (i < curvaActual.numSegmentos) {
+                            targetTemp = curvaActual.segmentos[i].tempObjetivo;
+                        }
                         xSemaphoreGive(xMutex);
+                    } else {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        continue;
                     }
 
                     if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
@@ -2150,22 +2341,27 @@ void TaskControlCurva(void* pvParameters) {
                         break;
                     }
                     if (estadoLocal == "PAUSADO") {
-                        // Pausa: esperar sin avanzar la rampa.
                         vTaskDelay(pdMS_TO_TICKS(500));
                         continue;
                     }
                     if (estadoLocal != "CALENTANDO") {
-                        // Estado transitorio: esperar y reevaluar.
                         vTaskDelay(pdMS_TO_TICKS(500));
                         continue;
                     }
 
-                    tempLocal += rampaPorSegundo;  // Simulación
+                    float tempSensor = 0.0f;
                     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        temperaturaActual = tempLocal;
+                        tempSensor = temperaturaActual;
                         xSemaphoreGive(xMutex);
                     }
-                    vTaskDelay(pdMS_TO_TICKS(1000));
+
+                    if (targetTemp > 0.0f && tempSensor >= targetTemp - reachTolerance) {
+                        Serial.printf("[Curva] Segmento %d: rampa OK (%.1f°C >= objetivo %.1f°C)\n",
+                                      i + 1, tempSensor, targetTemp);
+                        break;
+                    }
+
+                    vTaskDelay(pdMS_TO_TICKS(500));
                 }
                 if (aborted) break;
             } else {
@@ -2180,7 +2376,6 @@ void TaskControlCurva(void* pvParameters) {
             // desde cero para este segmento.
             unsigned long tiempoAcumuladoMs =
                 (i == startSegmentIdx && startPhase == "REMOJO") ? startSoakMs : 0UL;
-            unsigned long objetivoMs = (unsigned long)seg.tiempoRemojoMin * 60000UL;
 
             // Persistir entrada a la fase de remojo.
             {
@@ -2201,11 +2396,24 @@ void TaskControlCurva(void* pvParameters) {
             const unsigned long PERSIST_EVERY_MS = 30000UL;
             unsigned long lastPersistMs = tiempoAcumuladoMs;
 
-            while (tiempoAcumuladoMs < objetivoMs) {
+            while (true) {
                 String estadoLocal;
+                int soakMin = 0;
                 if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     estadoLocal = estadoHorno;
+                    if (i < curvaActual.numSegmentos) {
+                        soakMin = curvaActual.segmentos[i].tiempoRemojoMin;
+                    }
                     xSemaphoreGive(xMutex);
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
+
+                // Objetivo releído en cada ciclo: edición en caliente desde la app.
+                const unsigned long objetivoMs = (unsigned long)soakMin * 60000UL;
+                if (tiempoAcumuladoMs >= objetivoMs) {
+                    break;
                 }
 
                 if (estadoLocal == "DETENIDO" || estadoLocal == "IDLE") {
@@ -2283,6 +2491,14 @@ void TaskUpdateDisplayLVGL(void* pvParameters) {
             // Información del horno
             strncpy(displayData.kilnName, kilnName.c_str(), sizeof(displayData.kilnName) - 1);
             displayData.kilnName[sizeof(displayData.kilnName) - 1] = '\0';
+
+            if (deviceMacAddress.length() >= 4) {
+                String macTail = deviceMacAddress.substring(deviceMacAddress.length() - 4);
+                snprintf(displayData.deviceId, sizeof(displayData.deviceId), "SK-%s", macTail.c_str());
+            } else {
+                strncpy(displayData.deviceId, "--", sizeof(displayData.deviceId) - 1);
+            }
+            displayData.deviceId[sizeof(displayData.deviceId) - 1] = '\0';
             
             // Cargar nombre del programa con verificación
             static unsigned long lastProgramNameLog = 0;
@@ -2325,11 +2541,20 @@ void TaskUpdateDisplayLVGL(void* pvParameters) {
                    displayData.connection.bleConnected = bleClientConnected;
                    displayData.connection.firebaseConnected = firebaseConnected;
             
-            // Calcular temperatura objetivo (siempre de la etapa 1 del programa)
+            // Temperatura objetivo y rampa del segmento en curso
             displayData.targetTemp = 0.0;
+            displayData.stageRampCpm = -1.0f;
             if (curvaActual.numSegmentos > 0) {
-                // Siempre usar la temperatura objetivo del primer segmento (etapa 1)
-                displayData.targetTemp = curvaActual.segmentos[0].tempObjetivo;
+                int segIdx = 0;
+                const bool activeRun = (estadoHorno == "CALENTANDO" ||
+                                        estadoHorno == "PAUSADO" ||
+                                        estadoHorno == "INTERRUMPIDO");
+                if (activeRun && runCurrentSegment >= 0 &&
+                    runCurrentSegment < curvaActual.numSegmentos) {
+                    segIdx = runCurrentSegment;
+                    displayData.stageRampCpm = curvaActual.segmentos[segIdx].rampaCporMin;
+                }
+                displayData.targetTemp = curvaActual.segmentos[segIdx].tempObjetivo;
             }
             
             // Calcular tiempo transcurrido y total
@@ -2358,25 +2583,31 @@ void TaskUpdateDisplayLVGL(void* pvParameters) {
                 displayData.remainingMinutes = -1;
             }
             
-            // Calcular etapa (siempre mostrar etapa 1 del total)
+            // Etapa actual según progreso del programa
             if (curvaActual.numSegmentos > 0) {
                 displayData.totalStages = curvaActual.numSegmentos;
-                // Siempre mostrar etapa 1
-                displayData.currentStage = 1;
+                const bool activeRun = (estadoHorno == "CALENTANDO" ||
+                                        estadoHorno == "PAUSADO" ||
+                                        estadoHorno == "INTERRUMPIDO");
+                if (activeRun && runCurrentSegment >= 0 &&
+                    runCurrentSegment < curvaActual.numSegmentos) {
+                    displayData.currentStage = runCurrentSegment + 1;
+                } else {
+                    displayData.currentStage = 0;
+                }
             } else {
                 displayData.currentStage = 0;
                 displayData.totalStages = 0;
             }
             
-            // Determinar fase actual
-            if (estadoHorno == "CALENTANDO" && curvaActual.numSegmentos > 0) {
-                strncpy(displayData.currentPhase, "Ramp", sizeof(displayData.currentPhase) - 1);
+            // Fase actual dentro del segmento (RAMPA / REMOJO)
+            displayData.currentPhase[0] = '\0';
+            if ((estadoHorno == "CALENTANDO" || estadoHorno == "PAUSADO" ||
+                 estadoHorno == "INTERRUMPIDO") &&
+                runCurrentSegment >= 0 && runCurrentPhase.length() > 0) {
+                strncpy(displayData.currentPhase, runCurrentPhase.c_str(),
+                        sizeof(displayData.currentPhase) - 1);
                 displayData.currentPhase[sizeof(displayData.currentPhase) - 1] = '\0';
-            } else if (estadoHorno == "PAUSADO") {
-                strncpy(displayData.currentPhase, "Paused", sizeof(displayData.currentPhase) - 1);
-                displayData.currentPhase[sizeof(displayData.currentPhase) - 1] = '\0';
-            } else {
-                displayData.currentPhase[0] = '\0';
             }
             
             xSemaphoreGive(xMutex);
@@ -2393,7 +2624,7 @@ void TaskUpdateDisplayLVGL(void* pvParameters) {
             //     Serial.printf("  - programName='%s'\n", displayData.programName.c_str());
             //     lastMainLog = currentTime;
             // }
-            updateDisplayData(displayData);
+            display_postData(displayData);
         } else {
             // Serial.println("[DISPLAY] ⚠️ No se pudo adquirir mutex para actualizar display");
         }
@@ -2406,6 +2637,14 @@ void TaskUpdateDisplayLVGL(void* pvParameters) {
 
 // -------------------- SETUP Y LOOP --------------------
 void setup() {
+#if defined(ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    // Primero la pantalla: el splash gira mientras Serial/USB CDC enumeran
+    // (~5 s). No depende de WiFi/Firebase; el resto del setup no cambia.
+    if (initDisplayLVGL()) {
+        xTaskCreatePinnedToCore(displayTaskHandler, "LVGL_Handler", 4096, NULL, 1, NULL, 1);
+    }
+#endif
+
     // Delay inicial para USB CDC - ESP32-S3 necesita tiempo para enumerarse
     delay(3000);
     
@@ -2423,7 +2662,7 @@ void setup() {
     Serial.println("= ESP32-S3 INICIANDO.....              =");
     Serial.println("========================================");
     Serial.flush();
-    delay(500);
+    delay(200);
     
     // Configurar niveles de log DESPUÉS de que Serial esté funcionando
     esp_log_level_set("*", ESP_LOG_NONE);
@@ -2442,8 +2681,10 @@ void setup() {
     esp_log_level_set("phy_init", ESP_LOG_ERROR);
     
     Serial.println("[SETUP] ✅ Serial iniciado correctamente");
-    delay(50);  // Pequeño delay para asegurar que se envíe
-    
+#if defined(ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    Serial.println("[SETUP] Pantalla: splash de arranque (activo desde el inicio)");
+#endif
+
     // Inicializar objetos Firebase DESPUÉS de que Serial esté funcionando
     Serial.println("[SETUP] Inicializando objetos Firebase...");
     if (fbdo == nullptr) {
@@ -2477,9 +2718,12 @@ void setup() {
     // Verificar que se cargaron correctamente
     if (wifiConfigReceived && wifiSSID.length() > 0) {
         Serial.println("[SETUP] ✅ Credenciales WiFi cargadas correctamente");
+        // Primer intento STA con alineación de canal (sin bloquear setup).
+        Serial.println("[SETUP] Programando conexion STA a la WiFi de casa...");
+        wifi_manager_requestStaReconnect();
     } else {
         Serial.println("[SETUP] ⚠️ No hay credenciales WiFi guardadas");
-        Serial.println("[SETUP] El ESP32 esperará configuración desde la app vía BLE");
+        Serial.println("[SETUP] Configuralas desde la app (POST /api/kiln-info)");
     }
 
     delay(50);
@@ -2549,30 +2793,19 @@ void setup() {
     Serial.println("[SETUP] =========================================");
     Serial.println("\n");
 
-    // Inicializar pantalla LVGL (solo para ESP32-S3)
-    // Retrasar inicialización para asegurar que todo lo demás esté listo
-    delay(500);
-    // Logs de display comentados para enfocarse en BT y WiFi
-    // Serial.println("[SETUP] Preparándose para inicializar pantalla...");
-    // Reducir flush() - puede causar bloqueos en USB CDC
-    #if defined(ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S3)
-        // Serial.println("[SETUP] Intentando inicializar pantalla...");
-        if (initDisplayLVGL()) {
-            // Serial.println("[SETUP] ✅ Pantalla LVGL inicializada");
-            // Crear tarea para el handler de LVGL
-            if (xTaskCreatePinnedToCore(displayTaskHandler, "LVGL_Handler", 4096, NULL, 1, NULL, 1) != pdPASS) {
-                // Serial.println("[SETUP] ⚠️ Error al crear tarea LVGL_Handler");
-            }
-            // Crear tarea para actualizar datos de la pantalla
-            if (xTaskCreatePinnedToCore(TaskUpdateDisplayLVGL, "UpdateDisplay", 4096, NULL, 1, NULL, 0) != pdPASS) {
-                // Serial.println("[SETUP] ⚠️ Error al crear tarea UpdateDisplay");
-            }
-        } else {
-            // Serial.println("[SETUP] ⚠️ Pantalla no inicializada (continuando sin pantalla)");
+#if defined(ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    // Pasar de splash → UI principal (en la tarea LVGL) y empezar a pintar datos.
+    display_requestMainUi();
+    {
+        const unsigned long t0 = millis();
+        while (!display_isMainUiReady() && millis() - t0 < 3000) {
+            delay(20);
         }
-    #else
-        // Serial.println("[SETUP] ⚠️ No es ESP32-S3, pantalla no se inicializará");
-    #endif
+    }
+    if (xTaskCreatePinnedToCore(TaskUpdateDisplayLVGL, "UpdateDisplay", 4096, NULL, 1, NULL, 0) != pdPASS) {
+        Serial.println("[SETUP] ⚠️ No se pudo crear UpdateDisplay");
+    }
+#endif
 
     xTaskCreatePinnedToCore(TaskControlHorno, "ControlHorno", 4096, NULL, 1, NULL, 1);
     // TaskCom (Firebase + WiFi reconexion) corre en core 1 para no bloquear al
