@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <rect width="1600" height="900" fill="#f4f1ea"/>
+  <text x="80" y="48" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" fill="#222">SmartKiln  cápsula MAX31855, tapa corredera PLA</text>
+  <text x="80" y="74" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#555">Cotas en mm. Placa genérica 25×25, 4 agujeros paso 20. Verificar PCB_L/PCB_W con calibre.</text>
+
+  <!-- PLAN -->
+  <g transform="translate(80,120)">
+    <text x="0" y="-12" font-family="DejaVu Sans, Arial, sans-serif" font-size="14" font-weight="bold" fill="#222">Planta (tapa abierta)</text>
+    <!-- scale 8 px/mm -->
+    <!-- outer 62 x 32 -->
+    <rect x="0" y="40" width="496" height="256" fill="none" stroke="#222" stroke-width="2"/>
+    <!-- inner -->
+    <rect x="17.6" y="57.6" width="478.4" height="220.8" fill="#e8e4dc" stroke="#666" stroke-width="1"/>
+    <!-- rails -->
+    <rect x="17.6" y="47.2" width="478.4" height="10.4" fill="#c8c3b8" stroke="#555" stroke-width="0.8"/>
+    <rect x="17.6" y="278.4" width="478.4" height="10.4" fill="#c8c3b8" stroke="#555" stroke-width="0.8"/>
+    <!-- PCB 25x25 at x=10.2mm (81.6px) y=3.5mm from inner... PCB_Y = (32-25)/2 = 3.5, from outer y = 3.5*8=28, wait outer y starts 40, pcb y = 40+3.5*8 = 68 -->
+    <rect x="81.6" y="68" width="200" height="200" fill="#2f6db3" stroke="#1c3f70" stroke-width="1.5"/>
+    <!-- holes -->
+    <circle cx="101.6" cy="88" r="8.8" fill="none" stroke="#eee" stroke-width="1.5"/>
+    <circle cx="261.6" cy="88" r="8.8" fill="none" stroke="#eee" stroke-width="1.5"/>
+    <circle cx="101.6" cy="248" r="8.8" fill="none" stroke="#eee" stroke-width="1.5"/>
+    <circle cx="261.6" cy="248" r="8.8" fill="none" stroke="#eee" stroke-width="1.5"/>
+    <!-- terminal -->
+    <rect x="86" y="128" width="36" height="80" fill="#2e8b4a" stroke="#1d5c32" stroke-width="1"/>
+    <!-- header -->
+    <g fill="#222">
+      <rect x="266" y="108" width="10" height="10"/>
+      <rect x="266" y="128" width="10" height="10"/>
+      <rect x="266" y="148" width="10" height="10"/>
+      <rect x="266" y="168" width="10" height="10"/>
+      <rect x="266" y="188" width="10" height="10"/>
+    </g>
+    <!-- dupont envelope 16mm -->
+    <rect x="281.6" y="104" width="128" height="128" fill="none" stroke="#333" stroke-dasharray="6 4" stroke-width="1.2"/>
+    <text x="300" y="168" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#333">Dupont 16</text>
+    <!-- slots -->
+    <rect x="-4" y="144" width="22" height="48" fill="#f4f1ea" stroke="#222" stroke-width="1.5"/>
+    <rect x="478" y="128" width="22" height="112" fill="#f4f1ea" stroke="#222" stroke-width="1.5"/>
+
+    <!-- dims length -->
+    <line x1="0" y1="330" x2="496" y2="330" stroke="#222" stroke-width="1" marker-end="url(#arr)" marker-start="url(#arr)"/>
+    <text x="220" y="348" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#222">62.0</text>
+    <line x1="81.6" y1="0" x2="281.6" y2="0" stroke="#222" stroke-width="1"/>
+    <text x="155" y="-4" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#222">PCB 25.0</text>
+    <line x1="281.6" y1="16" x2="409.6" y2="16" stroke="#222" stroke-width="1"/>
+    <text x="318" y="12" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#222">16.0</text>
+    <!-- width -->
+    <line x1="-24" y1="40" x2="-24" y2="296" stroke="#222" stroke-width="1"/>
+    <text x="-58" y="176" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#222" transform="rotate(-90 -58 176)">32.0</text>
+    <text x="148" y="175" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#eef">25 × 25</text>
+    <text x="88" y="310" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#444">U TC 6 × 5</text>
+    <text x="400" y="310" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#444">U SPI 14 × 6</text>
+    <text x="90" y="58" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#444">agujeros Ø2.2 paso 20</text>
+  </g>
+
+  <!-- SECTION -->
+  <g transform="translate(720,120)">
+    <text x="0" y="-12" font-family="DejaVu Sans, Arial, sans-serif" font-size="14" font-weight="bold" fill="#222">Corte AA (ancho)</text>
+    <!-- scale 12 px/mm : 32mm = 384, 18mm = 216 -->
+    <rect x="40" y="80" width="384" height="216" fill="#d9d4c8" stroke="#222" stroke-width="2"/>
+    <!-- cavity -->
+    <rect x="66.4" y="80" width="331.2" height="194.4" fill="#f4f1ea" stroke="#888" stroke-width="1"/>
+    <!-- floor -->
+    <rect x="40" y="274.4" width="384" height="21.6" fill="#c4bfb3" stroke="#222" stroke-width="1"/>
+    <!-- pcb -->
+    <rect x="76" y="236" width="312" height="19.2" fill="#2f6db3" stroke="#1c3f70" stroke-width="1"/>
+    <!-- standoffs -->
+    <rect x="100" y="255.2" width="24" height="19.2" fill="#999"/>
+    <rect x="340" y="255.2" width="24" height="19.2" fill="#999"/>
+    <!-- lid -->
+    <polygon points="50,101.6 54,97.2 410,97.2 414,101.6 414,119.2 410,123.6 54,123.6 50,119.2" fill="#8a8680" stroke="#222" stroke-width="1.4"/>
+    <!-- vents hint -->
+    <rect x="160" y="104" width="8" height="16" fill="#f4f1ea"/>
+    <rect x="190" y="104" width="8" height="16" fill="#f4f1ea"/>
+    <rect x="220" y="104" width="8" height="16" fill="#f4f1ea"/>
+
+    <line x1="40" y1="320" x2="424" y2="320" stroke="#222" stroke-width="1"/>
+    <text x="210" y="338" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#222">32.0</text>
+    <line x1="460" y1="80" x2="460" y2="296" stroke="#222" stroke-width="1"/>
+    <text x="470" y="196" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#222">18.0</text>
+    <line x1="20" y1="80" x2="20" y2="123.6" stroke="#c00" stroke-width="1"/>
+    <text x="-8" y="70" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#c00">tapa 1.8</text>
+    <text x="70" y="160" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#333">pared 2.2</text>
+    <text x="70" y="292" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#333">piso 1.8</text>
+    <text x="180" y="228" font-family="DejaVu Sans, Arial, sans-serif" font-size="12" fill="#1c3f70">PCB 1.6 + poste 1.6</text>
+    <text x="70" y="148" font-family="DejaVu Sans, Arial, sans-serif" font-size="11" fill="#333">riel 1.3  ·  holgura Z 0.35</text>
+  </g>
+
+  <!-- NOTES -->
+  <g transform="translate(720,500)" font-family="DejaVu Sans, Arial, sans-serif" font-size="13" fill="#222">
+    <text x="0" y="0" font-weight="bold">Cierre</text>
+    <text x="0" y="22">Tapa entra por el extremo SPI (derecha). Tope en la pared de termocupla.</text>
+    <text x="0" y="42">Resalto de detent 0.30 mm chaflanado (no es gancho: PLA no flexiona).</text>
+    <text x="0" y="62">Costilla detrás del PCB para que el Dupont no arrastre la placa.</text>
+    <text x="0" y="92" font-weight="bold">Impresión PLA</text>
+    <text x="0" y="114">0.20 mm · 3 perímetros · 25 % infill · sin soportes</text>
+    <text x="0" y="134">Base: piso en la cama. Tapa: cara de ranuras en la cama.</text>
+    <text x="0" y="154">PETG no es necesario para el cierre; sí conviene lejos del horno.</text>
+  </g>
+</svg>
