@@ -1,6 +1,7 @@
 #include "kiln_commands.h"
 #include "kiln_shared.h"
 #include "wifi_manager.h"
+#include "kiln_firing_firebase.h"
 #include <ArduinoJson.h>
 
 extern void kiln_notifyLocalSessionComplete();
@@ -18,9 +19,12 @@ extern volatile int runCurrentSegment;
 extern String runCurrentPhase;
 extern volatile unsigned long runSoakAccumMs;
 extern volatile bool resumeFromSavedState;
+// offlineOnly / wifi* vía kiln_shared.h
+extern bool wifiConnected;
+extern bool firebaseConnected;
 
 String kiln_buildStatusJson() {
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<640> doc;
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         doc["temperature"] = temperaturaActual;
         doc["status"] = estadoHorno;
@@ -54,6 +58,13 @@ String kiln_buildStatusJson() {
             }
         }
         doc["currentStage"] = stageForApi;
+        doc["type"] = "KILN";
+        doc["resetReason"] = g_lastResetReason;
+        doc["resetCode"] = g_lastResetCode;
+        doc["bootCount"] = g_bootCount;
+        if (g_prevResetReason.length() > 0) {
+            doc["prevResetReason"] = g_prevResetReason;
+        }
         xSemaphoreGive(xMutex);
     } else {
         doc["error"] = "mutex_timeout";
@@ -64,13 +75,18 @@ String kiln_buildStatusJson() {
 }
 
 String kiln_buildInfoJson() {
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<448> doc;
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         doc["name"] = kilnName;
         doc["model"] = kilnModel;
         doc["volume"] = kilnVolume;
         doc["userId"] = userId;
         doc["macAddress"] = deviceMacAddress;
+        doc["type"] = "KILN";
+        doc["offlineOnly"] = offlineOnly;
+        doc["resetReason"] = g_lastResetReason;
+        doc["resetCode"] = g_lastResetCode;
+        doc["bootCount"] = g_bootCount;
         xSemaphoreGive(xMutex);
     }
     String out;
@@ -126,6 +142,14 @@ String kiln_processCommand(const String& cmdRaw) {
             int totalDuration = calculateProgramTotalDuration(currentTemp);
             programStartTime = millis();
             programTotalDurationMinutes = totalDuration;
+            kilnFiringBegin(
+                deviceMacAddress,
+                String(curvaActual.nombre),
+                kilnName,
+                currentTemp,
+                curvaActual.segmentos,
+                curvaActual.numSegmentos
+            );
         }
         saveRunState("CALENTANDO", 0, "RAMPA", 0UL, temperaturaActual);
         Serial.println("[API] START");
@@ -149,12 +173,17 @@ String kiln_processCommand(const String& cmdRaw) {
         // cambiamos el estado a CALENTANDO y la tarea hace el resto.
         estadoHorno = "CALENTANDO";
         programPauseTime = 0;
-        // No persistimos un run_state nuevo: TaskControlCurva va a hacerlo
-        // apenas entre al ciclo y reescriba con la temp/segmento correctos.
+        // Persistir ya como CALENTANDO (no dejar INTERRUMPIDO en NVS/RTDB).
+        saveRunState("CALENTANDO",
+                     runCurrentSegment >= 0 ? (int)runCurrentSegment : 0,
+                     runCurrentPhase.length() > 0 ? runCurrentPhase : String("RAMPA"),
+                     runSoakAccumMs,
+                     temperaturaActual);
         Serial.println("[API] RESUME");
     } else if (cmd == "STOP") {
         estadoHorno = "IDLE";
         programStartTime = 0;
+        kilnFiringRequestFinalize(false);
         programPauseTime = 0;
         // STOP cancela definitivamente: borramos el run_state para que un
         // reinicio futuro no levante INTERRUMPIDO.
@@ -185,6 +214,8 @@ String kiln_processCommand(const String& cmdRaw) {
     resp["cmd"] = cmd;
     resp["status"] = estadoHorno;
     if (cmd == "START" || cmd == "PAUSE" || cmd == "STOP" || cmd == "RESUME") {
+        // Publicar estado ya para que la app no lea el valor viejo en RTDB tras handoff.
+        kiln_tryPublishStatusNow(estadoHorno.c_str());
         kiln_onLocalSessionEnd(cmd.c_str());
     }
     String out;
@@ -193,7 +224,9 @@ String kiln_processCommand(const String& cmdRaw) {
 }
 
 bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
-    StaticJsonDocument<512> doc;
+    // Programas con varias etapas + programUpdatedAt superan fácilmente 512 B
+    // de capacidad ArduinoJson (no es el tamaño del string, son slots internos).
+    DynamicJsonDocument doc(3072);
     DeserializationError error = deserializeJson(doc, jsonStr);
     if (error) {
         errorOut = error.c_str();
@@ -202,6 +235,14 @@ bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
 
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
         errorOut = "mutex_timeout";
+        return false;
+    }
+
+    // No permitir cambiar programa mientras hornea o está en pausa.
+    if (estadoHorno == "CALENTANDO" || estadoHorno == "PAUSADO") {
+        xSemaphoreGive(xMutex);
+        errorOut = (estadoHorno == "PAUSADO") ? "busy_paused" : "busy_baking";
+        Serial.printf("[API] Perfil rechazado: estado=%s\n", estadoHorno.c_str());
         return false;
     }
 
@@ -231,9 +272,7 @@ bool kiln_loadProfileJson(const String& jsonStr, String& errorOut) {
     saveProfile();
     Serial.printf("[API] Perfil cargado: %s (%d seg) estado=%s\n",
                   curvaActual.nombre, curvaActual.numSegmentos, estadoHorno.c_str());
-    // Si hay cocción en curso, el perfil se aplica en caliente (TaskControlCurva
-    // relee objetivos/remojo). Igual liberamos la sesión AP del móvil.
-    kiln_onLocalSessionEnd("profile");
+    // No liberar SoftAP aquí: kiln_api debe responder HTTP primero.
     return true;
 }
 
@@ -254,24 +293,57 @@ bool kiln_applyKilnInfoJson(const String& jsonStr, String& errorOut) {
     kilnModel = doc["model"] | "Sin Modelo";
     kilnVolume = doc["volume"] | 0.0;
     userId = doc["userId"] | "";
+    const bool wasOfflineOnly = offlineOnly;
+    offlineOnly = doc["offlineOnly"] | false;
     pendingKilnInfoSave = true;
     needsDeviceInfoUpdate = true;
 
+    bool wifiCredsUpdated = false;
     JsonVariantConst wifiCfg = doc["wifi"];
-    if (!wifiCfg.isNull()) {
+    if (!offlineOnly && !wifiCfg.isNull()) {
         String newSsid = wifiCfg["ssid"] | "";
         String newPassword = wifiCfg["password"] | "";
         if (newSsid.length() > 0) {
             wifiSSID = newSsid;
             wifiPassword = newPassword;
             wifiConfigReceived = true;
+            wifiCredsUpdated = true;
             needsWifiReconnect = true;
             pendingWifiConfigSave = true;
         }
     }
+
+    if (offlineOnly) {
+        // Solo local: cortar STA/Firebase; SoftAP sticky.
+        needsWifiReconnect = false;
+        wifiConnected = false;
+        firebaseConnected = false;
+        wifi_manager_disconnectStaKeepAp();
+        Serial.println("[API] offlineOnly=1 — SoftAP sticky, sin STA/Firebase");
+    } else {
+        // Online: STA vía ciclo SoftAP release (beginStaToHome), NO reconnectToWifi
+        // completo — pelea con AP off y deja BearSSL en LoadProhibited (visto en log).
+        if (wifiSSID.length() > 0) {
+            wifiConfigReceived = true;
+            if (wifiCredsUpdated && !wasOfflineOnly) {
+                needsWifiReconnect = true;
+            } else {
+                needsWifiReconnect = false;
+            }
+            Serial.printf("[API] offlineOnly=0 — STA pendiente hacia '%s'%s\n",
+                          wifiSSID.c_str(),
+                          wasOfflineOnly ? " (via AP release)" : "");
+        } else {
+            Serial.println("[API] offlineOnly=0 — sin credenciales STA; SoftAP sigue sticky");
+        }
+        // Salida de Solo local: liberar SoftAP aunque Firebase aún no esté OK
+        // (si no, nunca se suelta el AP ni arranca la caza STA).
+        if (wasOfflineOnly) {
+            wifi_manager_armApReleaseWithoutFirebaseOnce();
+        }
+    }
     xSemaphoreGive(xMutex);
-    Serial.println("[API] kiln-info aplicado");
-    kiln_onLocalSessionEnd("kiln-info");
+    Serial.printf("[API] kiln-info aplicado (offlineOnly=%d)\n", offlineOnly ? 1 : 0);
     return true;
 }
 

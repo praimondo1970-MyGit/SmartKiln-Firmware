@@ -519,8 +519,9 @@ static void createMainUi(void)
 
     imgWifiIcon = createTintedIcon(mainScreen, &icon_wifi, COLOR_WHITE);
     lv_obj_align(imgWifiIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
+    lv_obj_add_flag(imgWifiIcon, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_align_to(labelConnText, imgWifiIcon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+    lv_obj_align(labelConnText, LV_ALIGN_TOP_RIGHT, -8, 10);
     lv_obj_align_to(labelConnDot, labelConnText, LV_ALIGN_OUT_LEFT_MID, -4, 0);
     layoutHeaderKilnNameBlock();
 
@@ -886,8 +887,24 @@ void display_ui_update(const DisplayData *data)
         lv_label_set_text(labelConnText, online ? "Conectado" : "Offline");
         lv_obj_set_style_text_color(labelConnText, online ? COLOR_WHITE : COLOR_MID_GRAY, LV_PART_MAIN);
     }
+    // Icono WiFi = SoftAP disponible para comandos (no STA/casa).
     if(imgWifiIcon != NULL) {
-        setIconTint(imgWifiIcon, data->connection.wifiConnected ? COLOR_WHITE : COLOR_MID_GRAY);
+        if(data->connection.softApAvailable) {
+            lv_obj_clear_flag(imgWifiIcon, LV_OBJ_FLAG_HIDDEN);
+            setIconTint(imgWifiIcon, COLOR_WHITE);
+            lv_obj_align(imgWifiIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
+            if(labelConnText != NULL) {
+                lv_obj_align_to(labelConnText, imgWifiIcon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+            }
+        } else {
+            lv_obj_add_flag(imgWifiIcon, LV_OBJ_FLAG_HIDDEN);
+            if(labelConnText != NULL) {
+                lv_obj_align(labelConnText, LV_ALIGN_TOP_RIGHT, -8, 10);
+            }
+        }
+        if(labelConnDot != NULL && labelConnText != NULL) {
+            lv_obj_align_to(labelConnDot, labelConnText, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+        }
     }
     layoutHeaderKilnNameBlock();
 
@@ -1002,6 +1019,7 @@ void display_ui_fill_demo(DisplayData *data, uint32_t tick_ms)
     strncpy(data->programName, "Esmalte Cone 6", sizeof(data->programName));
     data->connection.wifiConnected = true;
     data->connection.firebaseConnected = true;
+    data->connection.softApAvailable = true;
     data->targetTemp = 980.0f;
     data->totalStages = 4;
     data->totalMinutes = 240;
@@ -1044,6 +1062,7 @@ void display_ui_fill_demo(DisplayData *data, uint32_t tick_ms)
         data->currentTemp = 24.0f;
         data->remainingMinutes = -1;
         data->connection.wifiConnected = false;
+        data->connection.softApAvailable = false;
         break;
     }
 }

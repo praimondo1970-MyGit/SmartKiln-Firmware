@@ -5,6 +5,7 @@
 
 /* Material Symbols Rounded (filled), white + alpha for img_recolor. */
 LV_IMG_DECLARE(icon_wifi);
+LV_IMG_DECLARE(icon_softap);
 LV_IMG_DECLARE(icon_cloud);
 LV_IMG_DECLARE(icon_flame);
 LV_IMG_DECLARE(icon_target);

@@ -14,8 +14,9 @@ typedef struct {
     char status[24];
     struct {
         bool wifiConnected;
-        bool bleConnected;
         bool firebaseConnected;
+        /** SoftAP del horno activo (app puede enviar comandos locales). */
+        bool softApAvailable;
     } connection;
     int elapsedMinutes;
     int totalMinutes;

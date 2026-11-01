@@ -1,10 +1,16 @@
 #include "kiln_api.h"
 #include "kiln_commands.h"
+#include "wifi_manager.h"
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
 static WebServer s_server(80);
+
+/** Tráfico real de la app (no captive portal). Mantiene Local activo en el ESP. */
+static void noteAppHttp() {
+    wifi_manager_noteLocalHttp();
+}
 
 static void sendJson(int code, const String& body) {
     s_server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -37,19 +43,29 @@ static void handleNotFound() {
 }
 
 static void handleStatus() {
-    Serial.println("[API] GET /api/status");
+    noteAppHttp();
+    // No spamear Serial: la app hace poll agresivo de /api/status.
+    static unsigned long lastStatusLogMs = 0;
+    const unsigned long now = millis();
+    if (now - lastStatusLogMs >= 5000) {
+        lastStatusLogMs = now;
+        Serial.println("[API] GET /api/status (ok, log throttled 5s)");
+    }
     sendJson(200, kiln_buildStatusJson());
 }
 
 static void handleInfo() {
+    noteAppHttp();
     sendJson(200, kiln_buildInfoJson());
 }
 
 static void handleApInfo() {
+    noteAppHttp();
     sendJson(200, kiln_buildApInfoJson());
 }
 
 static void handleCommand() {
+    noteAppHttp();
     if (s_server.method() != HTTP_POST) {
         sendJson(405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -76,6 +92,7 @@ static void handleCommand() {
 }
 
 static void handleProfile() {
+    noteAppHttp();
     if (s_server.method() != HTTP_POST) {
         sendJson(405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -88,7 +105,10 @@ static void handleProfile() {
         doc["message"] = "PROFILE_OK";
         String out;
         serializeJson(doc, out);
+        // Responder ANTES de soltar el SoftAP (si no, la app ve fallo y el
+        // display puede quedar desincronizado con lo que cree la UI).
         sendJson(200, out);
+        kiln_onLocalSessionEnd("profile");
     } else {
         StaticJsonDocument<128> doc;
         doc["ok"] = false;
@@ -100,6 +120,7 @@ static void handleProfile() {
 }
 
 static void handleKilnInfo() {
+    noteAppHttp();
     if (s_server.method() != HTTP_POST) {
         sendJson(405, "{\"error\":\"method_not_allowed\"}");
         return;
@@ -107,7 +128,9 @@ static void handleKilnInfo() {
     String body = s_server.arg("plain");
     String err;
     if (kiln_applyKilnInfoJson(body, err)) {
+        // Responder ANTES de soltar SoftAP (igual que /api/profile).
         sendJson(200, "{\"ok\":true,\"message\":\"KILN_INFO_OK\"}");
+        kiln_onLocalSessionEnd("kiln-info");
     } else {
         StaticJsonDocument<128> doc;
         doc["ok"] = false;

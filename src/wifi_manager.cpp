@@ -7,6 +7,7 @@
 extern String wifiSSID;
 extern String wifiPassword;
 extern bool wifiConfigReceived;
+extern bool offlineOnly;
 
 static String s_apSsid;
 static String s_apPassword;
@@ -14,14 +15,16 @@ static String s_macStored;
 static int s_softApChannel = 1;
 static bool s_apPausedForInternet = false;
 
-// === WiFi AP handoff timing — perfil B (equilibrado) ===
-// Revertir a perfil A (conservador): GRACE=1200, FORCE=3000, OFF=30000, QUIET=1500
-// Gracia minima para que el cliente HTTP reciba la respuesta antes de tocar el AP.
+// === WiFi AP handoff timing — perfil C (rápido) ===
+// Perfil B: GRACE=800, FORCE=2000, OFF=12000
+// Perfil A (conservador): GRACE=1200, FORCE=3000, OFF=30000, QUIET=1500
+// Gracia mínima para que el cliente HTTP reciba la respuesta antes de tocar el AP.
+/** Gracia para que el POST kiln-info/comando termine de enviarse al móvil. */
 static const uint32_t AP_RELEASE_GRACE_MS = 800;
-/** Si el movil sigue en el AP, forzar apagado tras este tiempo (desde requestApRelease). */
+/** Si el móvil sigue en el AP, forzar apagado tras este tiempo (desde requestApRelease). */
 static const uint32_t AP_RELEASE_FORCE_MAX_MS = 2000;
-/** SoftAP off antes de restaurar AP (perfil B ~12 s; perfil A 30 s). */
-static const uint32_t AP_OFF_DURATION_MS = 12000;
+/** SoftAP off antes de restaurar AP (móvil vuelve a WiFi de casa / Firebase). */
+static const uint32_t AP_OFF_DURATION_MS = 8000;
 
 enum ApCycleState {
     AP_CYCLE_NORMAL = 0,
@@ -35,8 +38,27 @@ static unsigned long s_forceReleaseAt = 0;
 static unsigned long s_apRestoreAt = 0;
 static unsigned long s_lastStaBeginMs = 0;
 static unsigned long s_firebaseQuietUntil = 0;
+/** Último write RTDB exitoso (0 = nunca). Gate para liberar SoftAP. */
+static unsigned long s_lastFirebaseOkMs = 0;
+/** Una vez: permitir liberar SoftAP sin Firebase OK (salida de Solo local). */
+static bool s_armReleaseWithoutFirebase = false;
+/** Último HTTP de la app en SoftAP (0 = nunca). */
+static unsigned long s_lastLocalHttpMs = 0;
 static const uint32_t STA_BEGIN_MIN_INTERVAL_MS = 12000;
-static const uint32_t FIREBASE_QUIET_AFTER_AP_MS = 1000;
+/** Tras apagar SoftAP / transición radio: no tocar TLS hasta estabilizar STA. */
+static const uint32_t FIREBASE_QUIET_AFTER_AP_MS = 4000;
+/**
+ * Ventana en la que un write Firebase previo cuenta como “nube usable”
+ * para soltar SoftAP tras HTTP local. Si es más viejo → SoftAP sticky.
+ */
+static const uint32_t FIREBASE_OK_MAX_AGE_MS = 120000;
+/** Poll local de la app ~1–2 s: HTTP reciente = Local activo. */
+static const uint32_t LOCAL_HTTP_ACTIVE_MS = 12000;
+/**
+ * Cliente asociado al AP pero sin HTTP (app muerta / solo asociado):
+ * tras esta gracia se reanudan sondeos STA sin apagar SoftAP.
+ */
+static const uint32_t LOCAL_STATION_GRACE_MS = 45000;
 
 extern void kiln_onApRadioTransitionBegin();
 
@@ -44,14 +66,13 @@ static bool staHasValidIp() {
     return WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0;
 }
 
+// Definido más abajo; usado por pauseAp / STA antes de su cuerpo.
+bool wifi_manager_isLocalAppActive();
+
+
 /** WiFi moderno: sin modem-sleep agresivo (antes se usaba por coexistencia BLE). */
 void wifi_manager_applyRadioDefaults() {
     WiFi.setSleep(false);
-}
-
-// Compat: llamadas antiguas al nombre BLE.
-void wifi_manager_applyBleCoexistence() {
-    wifi_manager_applyRadioDefaults();
 }
 
 static void setStaDnsEspNetif(uint8_t a, uint8_t b, uint8_t c, uint8_t d,
@@ -93,48 +114,27 @@ void wifi_manager_ensurePublicDns() {
 static void startSoftAp();  // fwd
 
 bool wifi_manager_pauseApForInternet() {
-    if (wifi_manager_apStationCount() > 0) {
-        Serial.println("[WiFi] SoftAP con móvil — no se pausa (prioridad HTTP local)");
+    // Plan maestro Paso 1: SoftAP siempre vivo en Online.
+    // Los sondeos DNS/Firebase NO deben softAPdisconnect ni WIFI_STA-only.
+    if (wifi_manager_isLocalAppActive()) {
+        Serial.println("[WiFi] SoftAP Local activo — no se toca radio (prioridad HTTP)");
         wifi_manager_ensurePublicDns();
         return false;
     }
-    if (WiFi.getMode() == WIFI_STA && staHasValidIp()) {
-        s_apPausedForInternet = true;
-        wifi_manager_ensurePublicDns();
-        return true;
-    }
-
-    Serial.println("[WiFi] Pausando SoftAP → solo STA (DNS/Firebase)");
-    WiFi.softAPdisconnect(true);
-    delay(150);
-    WiFi.mode(WIFI_STA);
-    delay(200);
-    s_apPausedForInternet = true;
-    wifi_manager_applyRadioDefaults();
+    wifi_manager_ensureApRunning();
     wifi_manager_ensurePublicDns();
-
-    // Tras softAPdisconnect a veces hace falta un empujón al STA.
-    if (!staHasValidIp() && wifiConfigReceived && wifiSSID.length() > 0) {
-        Serial.printf("[WiFi] STA re-begin tras pausar AP: %s\n", wifiSSID.c_str());
-        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-        const unsigned long t0 = millis();
-        while (!staHasValidIp() && millis() - t0 < 8000) {
-            delay(200);
-        }
-    }
-    Serial.printf("[WiFi] Tras pausa AP: status=%d IP=%s\n",
-                  (int)WiFi.status(), WiFi.localIP().toString().c_str());
-    return staHasValidIp();
+    const bool ok = staHasValidIp();
+    Serial.printf("[WiFi] SoftAP vivo; STA IP=%s (sin pausar AP)\n",
+                  ok ? WiFi.localIP().toString().c_str() : "(ninguna)");
+    return ok;
 }
 
 void wifi_manager_resumeApAfterInternet() {
     if (!s_apPausedForInternet) {
         return;
     }
+    // Legado: si algún camino antiguo dejó el flag, restaurar SoftAP.
     s_apPausedForInternet = false;
-    // Una sola restauracion: si estamos en ventana de liberacion AP→STA,
-    // wifi_manager_tick() reabre el SoftAP al final. Evita el doble "softAP OK"
-    // (Firebase + ciclo AP off) que hace que el movil se reenganche.
     if (s_cycleState == AP_CYCLE_OFF || s_cycleState == AP_CYCLE_PENDING_OFF) {
         Serial.println("[AP] SoftAP diferido (ventana liberacion activa)");
         return;
@@ -150,7 +150,7 @@ void wifi_manager_resumeApAfterInternet() {
     }
     wifi_manager_ensureApStaMode();
     startSoftAp();
-    Serial.printf("[AP] SoftAP restaurado canal=%d (tras Internet/Firebase)\n",
+    Serial.printf("[AP] SoftAP restaurado canal=%d (legado tras pause)\n",
                   s_softApChannel);
 }
 
@@ -172,35 +172,6 @@ void wifi_manager_ensureApStaMode() {
         WiFi.mode(WIFI_AP_STA);
         delay(100);
     }
-}
-
-/**
- * En ESP32, SoftAP y STA comparten un solo radio: el STA solo puede
- * asociarse a redes en el MISMO canal que el SoftAP. Si el SoftAP queda
- * fijo en canal 1 y la WiFi de casa está en otro, WiFi.status() queda en 0/6
- * para siempre. Por eso alineamos el SoftAP al canal de la red guardada.
- */
-static int scanHomeWifiChannel(const char* ssid) {
-    if (ssid == nullptr || strlen(ssid) == 0) {
-        return -1;
-    }
-    Serial.printf("[WiFi] Escaneando canal de '%s'...\n", ssid);
-    const int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
-    int channel = -1;
-    for (int i = 0; i < n; i++) {
-        if (WiFi.SSID(i) == ssid) {
-            channel = WiFi.channel(i);
-            Serial.printf("[WiFi] Encontrada '%s' RSSI=%d canal=%d\n",
-                          ssid, WiFi.RSSI(i), channel);
-            break;
-        }
-    }
-    if (channel < 1) {
-        Serial.printf("[WiFi] '%s' no visible (%d redes). ¿SSID/pass o fuera de alcance?\n",
-                      ssid, n);
-    }
-    WiFi.scanDelete();
-    return channel;
 }
 
 static void startSoftAp() {
@@ -275,13 +246,13 @@ static void restoreApAfterRelease() {
     }
     wifi_manager_ensureApStaMode();
     startSoftAp();
-    if (wifiConfigReceived && wifiSSID.length() > 0 && wifi_manager_apStationCount() == 0) {
+    if (wifiConfigReceived && wifiSSID.length() > 0 && !wifi_manager_isLocalAppActive()) {
         if (!staHasValidIp()) {
             wifi_manager_requestStaReconnect();
-            Serial.printf("[AP] STA reanudado hacia '%s' (sin clientes en AP)\n", wifiSSID.c_str());
+            Serial.printf("[AP] STA reanudado hacia '%s' (sin Local activo)\n", wifiSSID.c_str());
         }
-    } else if (wifi_manager_apStationCount() > 0) {
-        Serial.println("[AP] STA diferido: movil conectado al AP (prioridad HTTP local)");
+    } else if (wifi_manager_isLocalAppActive()) {
+        Serial.println("[AP] STA diferido: app Local activa (prioridad HTTP)");
     }
     Serial.println("=================================");
     Serial.println("[AP] Punto de acceso disponible de nuevo (modo AP+STA)");
@@ -297,7 +268,8 @@ void wifi_manager_begin(const String& macNoColons) {
     String mac = macNoColons;
     mac.toUpperCase();
 
-    s_apSsid = "SmartKiln-" + suffixFromMac(mac, 4);
+    // SoftAP horno: SmartKiln-<8 hex> / password = mismos 8 hex (WPA2).
+    // SmartLink-<8 hex> queda reservado para DataLogger (otro firmware).
     s_apPassword = suffixFromMac(mac, 8);
     if (s_apPassword.length() < 8) {
         s_apPassword = mac;
@@ -308,6 +280,7 @@ void wifi_manager_begin(const String& macNoColons) {
             s_apPassword = s_apPassword.substring(s_apPassword.length() - 8);
         }
     }
+    s_apSsid = "SmartKiln-" + s_apPassword;
 
     s_cycleState = AP_CYCLE_NORMAL;
     s_releaseAt = 0;
@@ -358,7 +331,11 @@ void wifi_manager_ensureApRunning() {
 }
 
 bool wifi_manager_isApActive() {
-    if (s_apPausedForInternet || s_cycleState == AP_CYCLE_OFF) {
+    // PENDING_OFF = liberación ya pedida: el icono WiFi del display debe ocultarse
+    // de inmediato aunque el radio SoftAP aún no se haya cortado.
+    if (s_apPausedForInternet ||
+        s_cycleState == AP_CYCLE_OFF ||
+        s_cycleState == AP_CYCLE_PENDING_OFF) {
         return false;
     }
     return WiFi.softAPIP()[0] != 0;
@@ -380,20 +357,21 @@ void wifi_manager_prioritizeApClients() {
         return;
     }
     const int stations = wifi_manager_apStationCount();
+    const bool localActive = wifi_manager_isLocalAppActive();
 
-    if (s_cycleState == AP_CYCLE_NORMAL && stations > 0) {
+    if (s_cycleState == AP_CYCLE_NORMAL && (stations > 0 || localActive)) {
         wifi_manager_ensureApRunning();
     }
 
-    static int lastStations = 0;
-    if (s_cycleState == AP_CYCLE_NORMAL && lastStations > 0 && stations == 0 &&
+    static bool lastLocalActive = false;
+    if (s_cycleState == AP_CYCLE_NORMAL && lastLocalActive && !localActive &&
         wifiConfigReceived && wifiSSID.length() > 0) {
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[AP] Movil desconectado — iniciando STA para Firebase");
+            Serial.println("[AP] Local soltado — reanudando STA (SoftAP sigue)");
             wifi_manager_requestStaReconnect();
         }
     }
-    lastStations = stations;
+    lastLocalActive = localActive;
 }
 
 bool wifi_manager_isStaPausedForAp() {
@@ -422,8 +400,8 @@ void wifi_manager_tryStaConnect(const char* ssid, const char* password) {
         Serial.printf("[WiFi] STA begin (AP pausado) '%s'\n", ssid);
         return;
     }
-    if (wifi_manager_apStationCount() > 0) {
-        Serial.println("[WiFi] STA omitido: hay movil en el AP local");
+    if (wifi_manager_isLocalAppActive()) {
+        Serial.println("[WiFi] STA omitido: app Local activa (HTTP/SoftAP)");
         return;
     }
     if (s_cycleState == AP_CYCLE_PENDING_OFF || s_cycleState == AP_CYCLE_OFF) {
@@ -443,18 +421,15 @@ void wifi_manager_tryStaConnect(const char* ssid, const char* password) {
 
     if (s_cycleState == AP_CYCLE_NORMAL) {
         wifi_manager_ensureApStaMode();
-
-        const int homeCh = scanHomeWifiChannel(ssid);
-        if (homeCh >= 1 && homeCh <= 13 && homeCh != s_softApChannel) {
-            Serial.printf("[WiFi] SoftAP canal %d → %d (requerido por STA)\n",
-                          s_softApChannel, homeCh);
-            WiFi.softAPdisconnect(true);
-            delay(150);
-            s_softApChannel = homeCh;
-            startSoftAp();
-        } else {
-            wifi_manager_ensureApRunning();
-        }
+        // Nunca WiFi.scanNetworks / softAPdisconnect aquí: el scan apaga el
+        // beacon SoftAP unos segundos y el móvil pierde SmartKiln-… justo
+        // cuando reintentamos nube tras soltar Local.
+        wifi_manager_ensureApRunning();
+        Serial.println("[WiFi] STA begin sin scan (SoftAP se mantiene)");
+        WiFi.begin(ssid, password);
+        Serial.printf("[WiFi] STA begin '%s' (status=%d mode=%d apCh=%d)\n",
+                      ssid, (int)WiFi.status(), (int)WiFi.getMode(), s_softApChannel);
+        return;
     }
 
     WiFi.disconnect(false);
@@ -465,10 +440,23 @@ void wifi_manager_tryStaConnect(const char* ssid, const char* password) {
 }
 
 void wifi_manager_requestStaReconnect() {
+    if (offlineOnly) {
+        Serial.println("[WiFi] STA omitido — modo Solo local");
+        return;
+    }
     if (!wifiConfigReceived || wifiSSID.length() == 0) {
         return;
     }
     wifi_manager_tryStaConnect(wifiSSID.c_str(), wifiPassword.c_str());
+}
+
+void wifi_manager_disconnectStaKeepAp() {
+    // false = no apagar radio / SoftAP; solo soltar asociación STA.
+    WiFi.disconnect(false);
+    // BearSSL/FirebaseData no sobreviven un drop STA a medias: reciclar ya.
+    kiln_onApRadioTransitionBegin();
+    markFirebaseQuietPeriod();
+    Serial.println("[WiFi] STA desconectado — SoftAP intacto (Solo local)");
 }
 
 static void scheduleApRelease() {
@@ -476,12 +464,55 @@ static void scheduleApRelease() {
     s_releaseAt = now + AP_RELEASE_GRACE_MS;
     s_forceReleaseAt = now + AP_RELEASE_FORCE_MAX_MS;
     s_cycleState = AP_CYCLE_PENDING_OFF;
-    Serial.printf("[AP] Liberacion programada: gracia %lu s, forzar AP off max %lu s\n",
-                  (unsigned long)(AP_RELEASE_GRACE_MS / 1000),
-                  (unsigned long)(AP_RELEASE_FORCE_MAX_MS / 1000));
+    Serial.printf("[AP] Liberacion programada: gracia %lu ms, forzar AP off max %lu ms\n",
+                  (unsigned long)AP_RELEASE_GRACE_MS,
+                  (unsigned long)AP_RELEASE_FORCE_MAX_MS);
+}
+
+void wifi_manager_noteFirebaseOk() {
+    s_lastFirebaseOkMs = millis();
+}
+
+bool wifi_manager_isFirebaseOk() {
+    if (s_lastFirebaseOkMs == 0) {
+        return false;
+    }
+    const unsigned long age = millis() - s_lastFirebaseOkMs;
+    return age <= FIREBASE_OK_MAX_AGE_MS;
+}
+
+void wifi_manager_noteLocalHttp() {
+    s_lastLocalHttpMs = millis();
+}
+
+bool wifi_manager_isLocalAppActive() {
+    const unsigned long now = millis();
+    const bool httpFresh = (s_lastLocalHttpMs != 0) &&
+                           ((now - s_lastLocalHttpMs) <= LOCAL_HTTP_ACTIVE_MS);
+    if (httpFresh) {
+        return true;
+    }
+    const int stations = wifi_manager_apStationCount();
+    if (stations <= 0) {
+        return false;
+    }
+    // Asociado al AP: gracia hasta primer HTTP, o tras el último HTTP.
+    if (s_lastLocalHttpMs == 0) {
+        return true;
+    }
+    return (now - s_lastLocalHttpMs) <= LOCAL_STATION_GRACE_MS;
+}
+
+void wifi_manager_armApReleaseWithoutFirebaseOnce() {
+    s_armReleaseWithoutFirebase = true;
+    Serial.println("[AP] Armado: proxima liberacion sin exigir Firebase OK");
 }
 
 void wifi_manager_requestApRelease() {
+    if (offlineOnly) {
+        Serial.println("[AP] Liberacion omitida — SoftAP sticky (Solo local)");
+        return;
+    }
     if (s_apPausedForInternet) {
         Serial.println("[AP] Liberacion omitida (SoftAP ya pausado para Internet)");
         return;
@@ -494,10 +525,27 @@ void wifi_manager_requestApRelease() {
         Serial.println("[AP] Liberacion omitida (ventana STA activa)");
         return;
     }
+    // Sin WiFi de casa: SoftAP sticky (no apagar radio / no WIFI_OFF).
+    if (!wifiConfigReceived || wifiSSID.length() == 0) {
+        Serial.println("[AP] Liberacion omitida — SoftAP sticky (sin credenciales STA)");
+        return;
+    }
+    // Canal remoto = Firebase. Sin write reciente SoftAP sticky, salvo salida Solo local.
+    const bool forceWithoutFb = s_armReleaseWithoutFirebase;
+    if (forceWithoutFb) {
+        s_armReleaseWithoutFirebase = false;
+    }
+    if (!forceWithoutFb && !wifi_manager_isFirebaseOk()) {
+        Serial.println("[AP] Liberacion omitida — SoftAP sticky (Firebase no OK / sin write reciente)");
+        return;
+    }
+    if (forceWithoutFb) {
+        Serial.println("[AP] Liberacion forzada (Online tras Solo local) — sin Firebase OK aun");
+    }
     const int stations = wifi_manager_apStationCount();
     if (stations > 0) {
-        Serial.printf("[AP] Movil en AP (%d) — se apagara el AP en <=%lu s para liberar WiFi de casa\n",
-                      stations, (unsigned long)(AP_RELEASE_FORCE_MAX_MS / 1000));
+        Serial.printf("[AP] Movil en AP (%d) — se apagara el AP en <=%lu ms para liberar WiFi de casa\n",
+                      stations, (unsigned long)AP_RELEASE_FORCE_MAX_MS);
     }
     scheduleApRelease();
 }

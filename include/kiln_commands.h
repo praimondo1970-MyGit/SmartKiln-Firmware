@@ -18,5 +18,11 @@ String kiln_buildApInfoJson();
 /** Tras HTTP local (perfil, START, kiln-info): libera AP y marca sync Firebase. */
 void kiln_onLocalSessionEnd(const char* reason);
 
+/**
+ * Intenta publicar status en RTDB de inmediato (p. ej. RESUME → CALENTANDO)
+ * para que la app no lea INTERRUMPIDO viejo tras el handoff SoftAP.
+ */
+void kiln_tryPublishStatusNow(const char* status);
+
 /** Guarda programUpdatedAt (ms desde la app) y programa publicación en profileState. */
 void kiln_onProfileLoaded(unsigned long programUpdatedAtFromApp);

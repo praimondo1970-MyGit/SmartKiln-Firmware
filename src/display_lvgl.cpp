@@ -17,9 +17,8 @@ static lv_obj_t* headerDivider = nullptr;
 static lv_obj_t* headerKilnBlock = nullptr;
 static lv_obj_t* labelKilnTitle = nullptr;
 static lv_obj_t* labelDeviceId = nullptr;
-static lv_obj_t* labelConnDot = nullptr;
-static lv_obj_t* labelConnText = nullptr;
-static lv_obj_t* imgWifiIcon = nullptr;
+static lv_obj_t* imgWifiIcon = nullptr;   // STA / internet
+static lv_obj_t* imgSoftApIcon = nullptr; // SoftAP / hotspot
 
 // Panel izquierdo: gauge + avance
 static lv_obj_t* leftPanel = nullptr;
@@ -95,6 +94,8 @@ static const lv_color_t COLOR_DARK_GRAY = lv_color_hex(0x404040);
 /** Fondo de pista: herradura y barra de avance del ciclo. */
 static const lv_color_t COLOR_TRACK_GRAY = lv_color_hex(0x2A2A2A);
 static const lv_color_t COLOR_MID_GRAY = lv_color_hex(0x888888);
+/** Iconos de red inactivos: gris más apagado que MID_GRAY (menos contraste). */
+static const lv_color_t COLOR_ICON_OFF = lv_color_hex(0x3A3A3A);
 static const lv_color_t COLOR_LIGHT_GRAY = lv_color_hex(0xB0B0B0);
 static const lv_color_t COLOR_WHITE = lv_color_hex(0xFFFFFF);
 static const lv_color_t COLOR_YELLOW = lv_color_hex(0xFFCC00);
@@ -105,8 +106,8 @@ static const int SCREEN_H = 272;
 static const int HEADER_H = 36;
 static const int HEADER_KILN_MIN_W = 80;
 static const int HEADER_KILN_GAP_TO_CONN = 8;
-/** Espacio reservado a la derecha: WiFi + "Conectado" + punto + márgenes. */
-static const int HEADER_CONN_RESERVE_W = 112;
+/** Espacio reservado a la derecha: wifi + SoftAP + márgenes. */
+static const int HEADER_CONN_RESERVE_W = 52;
 /** Posición X de fallback del bloque nombre (logo + SmartKiln + separador). */
 static const int HEADER_KILN_NAME_X = 129;
 static const int HEADER_BRAND_GAP = 10;
@@ -298,10 +299,10 @@ static lv_coord_t calcHeaderKilnNameWidth() {
     lv_coord_t kilnLeft = HEADER_KILN_NAME_X;
     lv_coord_t connLeft = SCREEN_W - HEADER_CONN_RESERVE_W;
 
-    if (mainScreen != nullptr && headerKilnBlock != nullptr && labelConnDot != nullptr) {
+    if (mainScreen != nullptr && headerKilnBlock != nullptr && imgWifiIcon != nullptr) {
         lv_obj_update_layout(mainScreen);
         lv_coord_t measuredLeft = lv_obj_get_x(headerKilnBlock);
-        lv_coord_t measuredConn = lv_obj_get_x(labelConnDot);
+        lv_coord_t measuredConn = lv_obj_get_x(imgWifiIcon);
         if (measuredLeft > 0) kilnLeft = measuredLeft;
         if (measuredConn > kilnLeft + HEADER_KILN_MIN_W + HEADER_KILN_GAP_TO_CONN) {
             connLeft = measuredConn;
@@ -474,21 +475,13 @@ void createUI() {
     lv_obj_set_style_text_font(labelDeviceId, &inter_r10, LV_PART_MAIN);
     lv_obj_set_pos(labelDeviceId, 0, 14);
 
-    labelConnDot = lv_label_create(mainScreen);
-    lv_label_set_text(labelConnDot, LV_SYMBOL_OK);
-    lv_obj_set_style_text_color(labelConnDot, COLOR_GREEN, LV_PART_MAIN);
-    lv_obj_set_style_text_font(labelConnDot, &lv_font_montserrat_14, LV_PART_MAIN);
+    // WiFi (arco) = STA/internet; SoftAP (tethering) = red propia del horno.
+    // Siempre visibles: blanco = activo, gris = inactivo (sin check ni texto).
+    imgSoftApIcon = createTintedIcon(mainScreen, &icon_softap, COLOR_ICON_OFF);
+    lv_obj_align(imgSoftApIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
 
-    labelConnText = lv_label_create(mainScreen);
-    lv_label_set_text(labelConnText, "Conectado");
-    lv_obj_set_style_text_color(labelConnText, COLOR_WHITE, LV_PART_MAIN);
-    lv_obj_set_style_text_font(labelConnText, &inter_r12, LV_PART_MAIN);
-
-    imgWifiIcon = createTintedIcon(mainScreen, &icon_wifi, COLOR_WHITE);
-    lv_obj_align(imgWifiIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
-
-    lv_obj_align_to(labelConnText, imgWifiIcon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
-    lv_obj_align_to(labelConnDot, labelConnText, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+    imgWifiIcon = createTintedIcon(mainScreen, &icon_wifi, COLOR_ICON_OFF);
+    lv_obj_align_to(imgWifiIcon, imgSoftApIcon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
     layoutHeaderKilnNameBlock();
 
     // ---------- Panel izquierdo ----------
@@ -863,19 +856,24 @@ void updateDisplayData(const DisplayData& data) {
         lv_label_set_text(labelDeviceId, idBuf);
     }
 
-    const bool online = data.connection.wifiConnected || data.connection.firebaseConnected;
-    if (labelConnDot != nullptr) {
-        lv_obj_set_style_text_color(labelConnDot,
-            online ? COLOR_GREEN : COLOR_MID_GRAY, LV_PART_MAIN);
-    }
-    if (labelConnText != nullptr) {
-        lv_label_set_text(labelConnText, online ? "Conectado" : "Offline");
-        lv_obj_set_style_text_color(labelConnText,
-            online ? COLOR_WHITE : COLOR_MID_GRAY, LV_PART_MAIN);
+    // Iconos de red siempre visibles: blanco = activo, gris = inactivo.
+    const bool softApOn = data.connection.softApAvailable;
+    const bool internetOn =
+        data.connection.wifiConnected || data.connection.firebaseConnected;
+
+    if (imgSoftApIcon != nullptr) {
+        lv_obj_clear_flag(imgSoftApIcon, LV_OBJ_FLAG_HIDDEN);
+        setIconTint(imgSoftApIcon, softApOn ? COLOR_WHITE : COLOR_ICON_OFF);
+        lv_obj_align(imgSoftApIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
     }
     if (imgWifiIcon != nullptr) {
-        setIconTint(imgWifiIcon,
-            data.connection.wifiConnected ? COLOR_WHITE : COLOR_MID_GRAY);
+        lv_obj_clear_flag(imgWifiIcon, LV_OBJ_FLAG_HIDDEN);
+        setIconTint(imgWifiIcon, internetOn ? COLOR_WHITE : COLOR_ICON_OFF);
+        if (imgSoftApIcon != nullptr) {
+            lv_obj_align_to(imgWifiIcon, imgSoftApIcon, LV_ALIGN_OUT_LEFT_MID, -6, 0);
+        } else {
+            lv_obj_align(imgWifiIcon, LV_ALIGN_TOP_RIGHT, -8, 9);
+        }
     }
     layoutHeaderKilnNameBlock();
 

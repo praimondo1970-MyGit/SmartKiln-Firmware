@@ -36,6 +36,14 @@ extern bool needsDeviceInfoUpdate;
 extern String wifiSSID;
 extern String wifiPassword;
 extern bool wifiConfigReceived;
+/** true = Solo local: sin STA/Firebase. */
+extern bool offlineOnly;
+
+/** Diagnóstico de reinicio (main.cpp → /api/status). */
+extern String g_lastResetReason;
+extern int g_lastResetCode;
+extern uint32_t g_bootCount;
+extern String g_prevResetReason;
 
 int calculateProgramTotalDuration(float initialTemp);
 void saveProfile();
