@@ -137,15 +137,15 @@ static const int STATUS_PILL_HORNEANDO_TEXT_X_EXTRA = 5;
 static const int SPLASH_SPINNER_Y = -34;
 static const int SPLASH_SPINNER_SIZE = 88;
 static const int SPLASH_GLOW_OUTER_SIZE = 95;
-static const int SPLASH_GLOW_OUTER_SIZE = 95;
+
+typedef struct {
+    lv_coord_t size;
+    uint32_t color;
+    lv_opa_t opa;
+} GlowLayer;
 
 static void createSplashGlowLayers(lv_obj_t *parent, lv_coord_t yOffset)
 {
-    struct GlowLayer {
-        lv_coord_t size;
-        uint32_t color;
-        lv_opa_t opa;
-    };
     static const GlowLayer layers[] = {
         { 95, 0xFF5722, (lv_opa_t)3 },
         { 88, 0xF4511E, (lv_opa_t)4 },
